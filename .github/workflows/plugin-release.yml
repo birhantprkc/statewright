@@ -54,6 +54,7 @@ jobs:
         env:
           DIRECTORY: ${{ steps.plugin.outputs.directory }}
         run: |
+          node --test plugins/executor/tests/license-metadata.test.mjs
           if [ "$DIRECTORY" = "plugins/codex" ]; then
             node --test plugins/codex/tests/*.test.mjs
             bash -n plugins/codex/hook.sh plugins/codex/client-id.sh plugins/codex/mcp-proxy.sh
@@ -66,7 +67,9 @@ jobs:
           DIRECTORY: ${{ steps.plugin.outputs.directory }}
           ARTIFACT: ${{ steps.plugin.outputs.artifact }}
           VERSION: ${{ steps.plugin.outputs.version }}
-        run: zip -r "$ARTIFACT-$VERSION.zip" "$DIRECTORY" -x '*/node_modules/*' '*/.DS_Store'
+        run: |
+          cp plugins/LICENSE.md "$DIRECTORY/LICENSE.md"
+          zip -r "$ARTIFACT-$VERSION.zip" "$DIRECTORY" -x '*/node_modules/*' '*/.DS_Store'
       - name: Publish plugin release
         uses: softprops/action-gh-release@v2
         with:
