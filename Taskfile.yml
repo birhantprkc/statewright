@@ -102,9 +102,10 @@ tasks:
         sh: |
           LATEST=$(git tag -l 'gateway-v[0-9]*' | sed 's/gateway-v//' | sort -V | tail -1)
           if [ -z "$LATEST" ]; then echo "gateway-v1.0.0"; else
-            IFS=. read -r major minor patch <<EOF
-$LATEST
-EOF
+            major=${LATEST%%.*}
+            remainder=${LATEST#*.}
+            minor=${remainder%%.*}
+            patch=${remainder##*.}
             echo "gateway-v${major}.${minor}.$((patch + 1))"
           fi
     cmds:
