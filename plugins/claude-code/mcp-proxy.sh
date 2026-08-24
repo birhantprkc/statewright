@@ -10,8 +10,42 @@ GW_URL="${STATEWRIGHT_GATEWAY_URL:-}"
 GW_URL="${GW_URL:-https://mcp.statewright.ai}"
 PB_URL="${STATEWRIGHT_PB_URL:-https://statewright.ai}"
 KEY_FILE="$STATEWRIGHT_DIR/api_key"
+INVALID_KEY_SENTINEL="$STATEWRIGHT_DIR/invalid_api_key"
 # shellcheck source=client-id.sh
 source "${SCRIPT_DIR}/client-id.sh"
+
+key_fingerprint() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+  else
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+  fi
+}
+
+invalid_key_matches() {
+  [ -f "$INVALID_KEY_SENTINEL" ] &&
+    [ "$(cat "$INVALID_KEY_SENTINEL" 2>/dev/null)" = "$(key_fingerprint "$1")" ]
+}
+
+open_keys_page() {
+  [ "${STATEWRIGHT_NO_BROWSER:-false}" = "true" ] && return 0
+  if command -v open >/dev/null 2>&1; then open 'https://statewright.ai/keys' >/dev/null 2>&1 &
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open 'https://statewright.ai/keys' >/dev/null 2>&1 &
+  elif command -v wslview >/dev/null 2>&1; then wslview 'https://statewright.ai/keys' >/dev/null 2>&1 &
+  elif command -v powershell.exe >/dev/null 2>&1; then powershell.exe -NoProfile Start-Process 'https://statewright.ai/keys' >/dev/null 2>&1 &
+  fi
+}
+
+mark_invalid_key() {
+  local fingerprint
+  fingerprint=$(key_fingerprint "$1")
+  mkdir -p "$STATEWRIGHT_DIR" 2>/dev/null || return 0
+  if [ "$(cat "$INVALID_KEY_SENTINEL" 2>/dev/null || true)" != "$fingerprint" ]; then
+    printf '%s\n' "$fingerprint" > "$INVALID_KEY_SENTINEL"
+    chmod 600 "$INVALID_KEY_SENTINEL"
+    open_keys_page
+  fi
+}
 
 inject_claude_local_tools() {
   local response="$1"
@@ -195,10 +229,17 @@ upload_client_tools() {
   fi
 
   # Upload tools + commands to PB
-  curl -sf --max-time 10 -X POST "$PB_URL/api/client-tools" \
+  local response status body
+  body=$(mktemp "${TMPDIR:-/tmp}/statewright-client-tools.XXXXXX") || return 0
+  status=$(curl -sS --max-time 10 -o "$body" -w '%{http_code}' -X POST "$PB_URL/api/client-tools" \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer $key" \
-    -d "{\"tools\": $tools, \"commands\": $commands}" >/dev/null 2>&1
+    -d "{\"tools\": $tools, \"commands\": $commands}" 2>/dev/null || true)
+  response=$(cat "$body" 2>/dev/null || true)
+  rm -f "$body"
+  if [ "$status" = "401" ] && printf '%s' "$response" | jq -e '.error == "invalid_api_key"' >/dev/null 2>&1; then
+    mark_invalid_key "$key"
+  fi
 }
 
 # --- Main proxy loop ---
@@ -207,6 +248,18 @@ while IFS= read -r line; do
 
   API_KEY="${STATEWRIGHT_API_KEY:-$(cat "$KEY_FILE" 2>/dev/null || true)}"
   API_KEY="${API_KEY%"${API_KEY##*[![:space:]]}"}"  # trim trailing whitespace/newlines
+  METHOD=$(echo "$line" | jq -r '.method // empty' 2>/dev/null)
+
+  if [ -n "$API_KEY" ] && ! invalid_key_matches "$API_KEY"; then
+    rm -f "$INVALID_KEY_SENTINEL"
+  fi
+
+  if [ -n "$API_KEY" ] && invalid_key_matches "$API_KEY"; then
+    if [ "$METHOD" != "notifications/initialized" ]; then
+      echo '{"jsonrpc":"2.0","error":{"code":-1,"message":"Statewright API key is invalid or revoked. Visit https://statewright.ai/keys to generate a new key, then restart this client."},"id":'"$(echo "$line" | jq -r '.id // null' 2>/dev/null)"'}'
+    fi
+    continue
+  fi
 
   if [ -z "$API_KEY" ]; then
     METHOD=$(echo "$line" | jq -r '.method // empty' 2>/dev/null)
@@ -223,8 +276,6 @@ while IFS= read -r line; do
     fi
     continue
   fi
-
-  METHOD=$(echo "$line" | jq -r '.method // empty' 2>/dev/null)
 
   # Notifications: no response needed, trigger side effects
   if [ "$METHOD" = "notifications/initialized" ]; then
