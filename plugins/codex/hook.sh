@@ -309,6 +309,46 @@ reset_native_telemetry_state() {
   echo "$effective_at" > "$PROJECT_DIR/.state_effective_at"
   echo "0" > "$PROJECT_DIR/.telemetry_tool_bytes"
   echo "0" > "$PROJECT_DIR/.telemetry_tool_count"
+  reset_stop_continuation_state
+}
+
+# Stop continuation is local policy, deliberately independent of telemetry and
+# gateway availability. A state transition resets the policy epoch; ordinary
+# tools advance liveness without granting an unbounded Stop loop.
+reset_stop_continuation_state() {
+  echo "0" > "$PROJECT_DIR/.stop_progress"
+  rm -f "$PROJECT_DIR/.stop_nudges"
+}
+
+record_stop_progress() {
+  local progress
+  progress=$(cat "$PROJECT_DIR/.stop_progress" 2>/dev/null || echo "0")
+  case "$progress" in ''|*[!0-9]*) progress=0 ;; esac
+  echo $((progress + 1)) > "$PROJECT_DIR/.stop_progress"
+}
+
+allow_stop_nudge() {
+  local state_json="$1" run_id local_run_id epoch progress prior_run prior_epoch prior_progress prior_nudges nudges
+  run_id=$(echo "$state_json" | jq -r '.run_id // empty' 2>/dev/null || true)
+  local_run_id=$(cat "$PROJECT_DIR/.run_id" 2>/dev/null || true)
+  [ -n "$run_id" ] && [ -n "$local_run_id" ] && [ "$run_id" != "$local_run_id" ] && return 1
+  epoch=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "1")
+  progress=$(cat "$PROJECT_DIR/.stop_progress" 2>/dev/null || echo "0")
+  case "$epoch" in ''|*[!0-9]*) epoch=1 ;; esac
+  case "$progress" in ''|*[!0-9]*) progress=0 ;; esac
+  if [ -f "$PROJECT_DIR/.stop_nudges" ]; then
+    IFS='|' read -r prior_run prior_epoch prior_progress prior_nudges < "$PROJECT_DIR/.stop_nudges" || true
+  fi
+  if [ "$prior_run" = "$run_id" ] && [ "$prior_epoch" = "$epoch" ]; then
+    [ "$prior_progress" = "$progress" ] && return 1
+    case "$prior_nudges" in ''|*[!0-9]*) prior_nudges=0 ;; esac
+    [ "$prior_nudges" -ge 3 ] && return 1
+    nudges=$((prior_nudges + 1))
+  else
+    nudges=1
+  fi
+  printf '%s|%s|%s|%s\n' "$run_id" "$epoch" "$progress" "$nudges" > "$PROJECT_DIR/.stop_nudges"
+  return 0
 }
 
 # ============================================================
@@ -656,11 +696,12 @@ case "$ENDPOINT" in
         ;;
       stop)
         # Deactivate enforcement
-        rm -f "$ACTIVE_FILE" "$CACHE_FILE" "$PROJECT_DIR/.session_hinted" "$PROJECT_DIR/.discovered_commands" "$PROJECT_DIR/.capture_enabled" "$PROJECT_DIR/.run_id" "$PROJECT_DIR/.log_seq" "$PROJECT_DIR/.telemetry_seq" "$PROJECT_DIR/.state_epoch" "$PROJECT_DIR/.state_effective_at" "$PROJECT_DIR/.telemetry_tool_bytes" "$PROJECT_DIR/.telemetry_tool_count"
+        rm -f "$ACTIVE_FILE" "$CACHE_FILE" "$PROJECT_DIR/.session_hinted" "$PROJECT_DIR/.discovered_commands" "$PROJECT_DIR/.capture_enabled" "$PROJECT_DIR/.run_id" "$PROJECT_DIR/.log_seq" "$PROJECT_DIR/.telemetry_seq" "$PROJECT_DIR/.state_epoch" "$PROJECT_DIR/.state_effective_at" "$PROJECT_DIR/.telemetry_tool_bytes" "$PROJECT_DIR/.telemetry_tool_count" "$PROJECT_DIR/.stop_progress" "$PROJECT_DIR/.stop_nudges"
         ;;
       transition)
         # Read previous state before refreshing
         PREV_STATE=$(cat "$CACHE_FILE" 2>/dev/null | jq -r '.state // empty' 2>/dev/null || true)
+        PREV_TRANSITION_COUNT=$(cat "$CACHE_FILE" 2>/dev/null | jq -r '.transition_count // empty' 2>/dev/null || true)
 
         # Check for fork/join results in tool output
         PARSED_RESULT=$(extract_mcp_result_text "$TOOL_RESULT")
@@ -674,10 +715,26 @@ case "$ENDPOINT" in
         if [ -n "$STATE_JSON" ]; then
           echo "$STATE_JSON" > "$CACHE_FILE"
           NEW_STATE=$(echo "$STATE_JSON" | jq -r '.state // empty' 2>/dev/null || true)
+          NEW_TRANSITION_COUNT=$(echo "$STATE_JSON" | jq -r '.transition_count // empty' 2>/dev/null || true)
           IS_FINAL=$(echo "$STATE_JSON" | jq -r '.is_final // false' 2>/dev/null || true)
-          PREV_EPOCH=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "0")
-          case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
-          reset_native_telemetry_state $((PREV_EPOCH + 1))
+          TRANSITION_SUCCEEDED=false
+          case "$PREV_TRANSITION_COUNT" in
+            ''|*[!0-9]*) ;;
+            *)
+              case "$NEW_TRANSITION_COUNT" in
+                ''|*[!0-9]*) ;;
+                *) [ "$NEW_TRANSITION_COUNT" -gt "$PREV_TRANSITION_COUNT" ] && TRANSITION_SUCCEEDED=true ;;
+              esac
+              ;;
+          esac
+          if [ "$TRANSITION_SUCCEEDED" != "true" ] && [ "$(echo "$PARSED_RESULT" | jq -r 'if (.transitioned == true or .forced == true or .forked == true or .joined == true or .failed == true or (.branch_completed? != null) or (.subflow_started? != null) or (.subflow_completed? != null)) then "true" else "false" end' 2>/dev/null || true)" = "true" ]; then
+            TRANSITION_SUCCEEDED=true
+          fi
+          if [ "$TRANSITION_SUCCEEDED" = "true" ]; then
+            PREV_EPOCH=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "0")
+            case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
+            reset_native_telemetry_state $((PREV_EPOCH + 1))
+          fi
           if [ "$IS_FINAL" = "true" ]; then
             emit_native_telemetry "workflow_completed" "$STATE_JSON"
           else
@@ -718,7 +775,7 @@ case "$ENDPOINT" in
               echo "{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"[statewright] REVIEW REQUIRED: ${APPROVAL_MESSAGE} Present this approval request to the user in the current UI. Do not continue the workflow until the user approves or rejects it.\"}}"
             fi
           elif [ "$IS_FINAL" = "true" ]; then
-            rm -f "$ACTIVE_FILE" "$CACHE_FILE" "$PROJECT_DIR/.session_hinted" "$PROJECT_DIR/.discovered_commands" "$PROJECT_DIR/.capture_enabled" "$PROJECT_DIR/.run_id" "$PROJECT_DIR/.log_seq" "$PROJECT_DIR/.telemetry_seq" "$PROJECT_DIR/.state_epoch" "$PROJECT_DIR/.state_effective_at" "$PROJECT_DIR/.telemetry_tool_bytes" "$PROJECT_DIR/.telemetry_tool_count"
+            rm -f "$ACTIVE_FILE" "$CACHE_FILE" "$PROJECT_DIR/.session_hinted" "$PROJECT_DIR/.discovered_commands" "$PROJECT_DIR/.capture_enabled" "$PROJECT_DIR/.run_id" "$PROJECT_DIR/.log_seq" "$PROJECT_DIR/.telemetry_seq" "$PROJECT_DIR/.state_epoch" "$PROJECT_DIR/.state_effective_at" "$PROJECT_DIR/.telemetry_tool_bytes" "$PROJECT_DIR/.telemetry_tool_count" "$PROJECT_DIR/.stop_progress" "$PROJECT_DIR/.stop_nudges"
             echo "{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"[statewright] ${PREV_STATE} => ${NEW_STATE} (workflow complete, enforcement deactivated)\"}}"
           elif [ -n "$NEW_STATE" ]; then
             NEXT_TRANSITIONS=$(echo "$STATE_JSON" | jq -r '.transitions // [] | map(.event + " -> " + .target) | join(", ")' 2>/dev/null || true)
@@ -741,6 +798,9 @@ case "$ENDPOINT" in
         fi
         ;;
     esac
+    if [ -f "$ACTIVE_FILE" ] && [ -z "$SW_ACTION" ]; then
+      record_stop_progress
+    fi
     if [ -f "$ACTIVE_FILE" ] && [ -z "$SW_ACTION" ] && [ -f "$CACHE_FILE" ]; then
       emit_native_telemetry "tool_observed" "$(cat "$CACHE_FILE")"
     fi
@@ -748,8 +808,25 @@ case "$ENDPOINT" in
     ;;
 
   stop)
-    # Review gates are surfaced from PostToolUse. Stop must never suppress the
-    # host UI's prompt or an external review integration.
+    [ "${STATEWRIGHT_STOP_CONTINUATION:-1}" = "0" ] && exit 0
+    [ -f "$ACTIVE_FILE" ] || exit 0
+    STATE_JSON=""
+    if [ -f "$CACHE_FILE" ]; then
+      STATE_JSON=$(cat "$CACHE_FILE")
+    else
+      STATE_JSON=$(mcp_call '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"statewright_get_state","arguments":{}},"id":1}')
+      [ -n "$STATE_JSON" ] && echo "$STATE_JSON" > "$CACHE_FILE"
+    fi
+    CURRENT=$(echo "$STATE_JSON" | jq -r '.state // empty' 2>/dev/null || true)
+    [ -n "$CURRENT" ] || exit 0
+    [ "$(echo "$STATE_JSON" | jq -r '.is_final // false' 2>/dev/null || true)" = "true" ] && exit 0
+    [ -n "$(echo "$STATE_JSON" | jq -r '.pending_approval.approval_id // empty' 2>/dev/null || true)" ] && exit 0
+    allow_stop_nudge "$STATE_JSON" || exit 0
+    ITER=$(echo "$STATE_JSON" | jq -r '.iteration // 0' 2>/dev/null || true)
+    MAX=$(echo "$STATE_JSON" | jq -r '.max_iterations // "none"' 2>/dev/null || true)
+    TOOLS=$(echo "$STATE_JSON" | jq -r '.allowed_tools // [] | join(", ")' 2>/dev/null || true)
+    TRANSITIONS=$(echo "$STATE_JSON" | jq -r '.transitions // [] | map(.event + " -> " + .target) | join(", ")' 2>/dev/null || true)
+    jq -n --arg reason "Statewright workflow remains active. Phase: $CURRENT (iteration $ITER/$MAX). Tools: $TOOLS. Transitions: $TRANSITIONS. CONTINUATION REQUIRED: do not stop, summarize, or wait for a new user prompt. Continue immediately with only the state-allowed tools and call statewright_transition when this phase is complete." '{"decision":"block","reason":$reason}'
     exit 0
     ;;
 

@@ -9,9 +9,9 @@ import { cliModel, codexArgs, parseArgs, run } from "../scripts/statewright-code
 
 const codexRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-async function invokeHook(input, environment) {
+async function invokeHook(input, environment, endpoint = "post-tool") {
   return await new Promise((resolveResult) => {
-    const child = spawn("bash", [resolve(codexRoot, "hook.sh"), "post-tool"], {
+    const child = spawn("bash", [resolve(codexRoot, "hook.sh"), endpoint], {
       env: { ...process.env, ...environment },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -70,6 +70,46 @@ test("workflow load emits an atomic route restart request only for a supervised 
   } finally {
     await rm(home, { recursive: true, force: true });
     await rm(controlDir, { recursive: true, force: true });
+  }
+});
+
+test("standalone Stop caps nudges per epoch and permits a duplicate Stop", async () => {
+  const home = await mkdtemp(resolve(tmpdir(), "statewright-tui-hook-"));
+  const environment = { HOME: home, STATEWRIGHT_CLIENT_ID: "stop-nudge-test" };
+  try {
+    const loaded = await invokeHook({
+      session_id: "session-stop",
+      tool_name: "mcp__statewright__statewright_load_workflow",
+      tool_response: JSON.stringify({ state_snapshot: {
+        workflow: "routing-test", state: "implement", run_id: "run-stop",
+        allowed_tools: ["Read"], transitions: [{ event: "DONE", target: "completed" }],
+      } }),
+    }, environment);
+    assert.equal(loaded.status, 0, loaded.stderr);
+
+    const firstStop = await invokeHook({ session_id: "session-stop" }, environment, "stop");
+    assert.equal(firstStop.status, 0, firstStop.stderr);
+    assert.equal(JSON.parse(firstStop.stdout).decision, "block");
+
+    for (let index = 0; index < 2; index += 1) {
+      const progress = await invokeHook({ session_id: "session-stop", tool_name: "Read", tool_response: "ok" }, environment);
+      assert.equal(progress.status, 0, progress.stderr);
+      const nextStop = await invokeHook({ session_id: "session-stop" }, environment, "stop");
+      assert.equal(nextStop.status, 0, nextStop.stderr);
+      assert.equal(JSON.parse(nextStop.stdout).decision, "block");
+    }
+
+    const cappedProgress = await invokeHook({ session_id: "session-stop", tool_name: "Read", tool_response: "ok" }, environment);
+    assert.equal(cappedProgress.status, 0, cappedProgress.stderr);
+    const cappedStop = await invokeHook({ session_id: "session-stop" }, environment, "stop");
+    assert.equal(cappedStop.status, 0, cappedStop.stderr);
+    assert.equal(cappedStop.stdout, "");
+
+    const duplicateStop = await invokeHook({ session_id: "session-stop" }, environment, "stop");
+    assert.equal(duplicateStop.status, 0, duplicateStop.stderr);
+    assert.equal(duplicateStop.stdout, "");
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 });
 

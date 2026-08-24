@@ -8,16 +8,18 @@ import test from "node:test";
 
 const hook = resolve("plugins/claude-code/hook.sh");
 
-async function runHook(input, environment) {
+async function runHook(input, environment, endpoint = "post-tool") {
   return await new Promise((resolveResult, rejectResult) => {
-    const child = spawn("bash", [hook, "post-tool"], {
+    const child = spawn("bash", [hook, endpoint], {
       env: { ...process.env, ...environment },
       stdio: ["pipe", "pipe", "pipe"],
     });
+    let stdout = "";
     let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
     child.once("error", rejectResult);
-    child.once("exit", (code) => resolveResult({ code, stderr }));
+    child.once("exit", (code) => resolveResult({ code, stdout, stderr }));
     child.stdin.end(`${JSON.stringify(input)}\n`);
   });
 }
@@ -49,6 +51,30 @@ test("Claude workflow load emits a route request only for a managed client", asy
     assert.equal(request.client_id, "swc_0123456789abcdef0123456789abcdef");
     assert.equal(request.model, "claude-opus-4-6");
     assert.equal(request.effort, "high");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("Claude standalone Stop nudges an active workflow once, then permits the duplicate Stop", async () => {
+  const root = await mkdtemp(join(tmpdir(), "statewright-claude-stop-"));
+  const home = join(root, "home");
+  const bin = join(root, "bin");
+  const control = join(root, "control");
+  const state = { state: "implement", run_id: "run-stop", allowed_tools: ["Read"], transitions: [{ event: "DONE", target: "completed" }] };
+  try {
+    await (await import("node:fs/promises")).mkdir(control, { recursive: true });
+    await (await import("node:fs/promises")).mkdir(bin, { recursive: true });
+    await writeFile(join(control, "identity.json"), '{"version":1,"host":"claude","client_id":"swc_0123456789abcdef0123456789abcdef"}\n');
+    await writeFile(join(bin, "curl"), `#!/usr/bin/env sh\nprintf '%s' ${JSON.stringify(JSON.stringify({ result: { content: [{ text: JSON.stringify(state) }] } }))}\n`);
+    await chmod(join(bin, "curl"), 0o755);
+    const environment = { HOME: home, PATH: `${bin}:${process.env.PATH}`, STATEWRIGHT_ROUTE_CONTROL_DIR: control, STATEWRIGHT_API_KEY: "test" };
+    const loaded = await runHook({ session_id: "claude-stop", tool_name: "mcp__plugin_statewright_statewright_load_workflow", tool_response: JSON.stringify([{ text: JSON.stringify({ run_id: "run-stop" }) }]) }, environment);
+    assert.equal(loaded.code, 0, loaded.stderr);
+    const firstStop = await runHook({ session_id: "claude-stop" }, environment, "stop");
+    assert.equal(firstStop.code, 0, firstStop.stderr);
+    assert.equal(JSON.parse(firstStop.stdout).decision, "block");
+    const duplicateStop = await runHook({ session_id: "claude-stop" }, environment, "stop");
+    assert.equal(duplicateStop.code, 0, duplicateStop.stderr);
+    assert.equal(duplicateStop.stdout, "");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

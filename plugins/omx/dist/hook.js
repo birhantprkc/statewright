@@ -334,7 +334,10 @@ function deactivate(sessionDir) {
     ".discovered_commands",
     ".capture_enabled",
     ".run_id",
-    ".log_seq"
+    ".log_seq",
+    ".stop_epoch",
+    ".stop_progress",
+    ".stop_nudges"
   ];
   for (const f of files) {
     try {
@@ -342,6 +345,41 @@ function deactivate(sessionDir) {
     } catch {
     }
   }
+}
+var STOP_NUDGE_LIMIT = 3;
+function readCounter(sessionDir, file, fallback = 0) {
+  try {
+    const value = Number.parseInt(readFileSync(join(sessionDir, file), "utf8").trim(), 10);
+    return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function resetStopContinuation(sessionDir, epoch = 1) {
+  mkdirSync(sessionDir, { recursive: true });
+  writeFileSync(join(sessionDir, ".stop_epoch"), String(epoch));
+  writeFileSync(join(sessionDir, ".stop_progress"), "0");
+  try {
+    unlinkSync(join(sessionDir, ".stop_nudges"));
+  } catch {
+  }
+}
+function recordStopProgress(sessionDir) {
+  writeFileSync(join(sessionDir, ".stop_progress"), String(readCounter(sessionDir, ".stop_progress") + 1));
+}
+function advanceStopEpoch(sessionDir) {
+  resetStopContinuation(sessionDir, readCounter(sessionDir, ".stop_epoch", 0) + 1);
+}
+function readStopNudgeLedger(sessionDir) {
+  try {
+    const parsed = JSON.parse(readFileSync(join(sessionDir, ".stop_nudges"), "utf8"));
+    return typeof parsed.runId === "string" && Number.isSafeInteger(parsed.epoch) && Number.isSafeInteger(parsed.progress) && Number.isSafeInteger(parsed.nudges) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function writeStopNudgeLedger(sessionDir, ledger) {
+  writeFileSync(join(sessionDir, ".stop_nudges"), JSON.stringify(ledger));
 }
 async function handleUserPrompt(input, opts) {
   if (opts.adapterUrl) {
@@ -602,6 +640,7 @@ async function handlePostTool(input, opts) {
     swAction = "transition";
   else if (/statewright_get_state/.test(toolName)) swAction = "refresh_cache";
   if (!swAction && isActive(opts.sessionDir)) {
+    recordStopProgress(opts.sessionDir);
     const rawCache = readCache(opts.sessionDir);
     if (rawCache) {
       const cache = parseGatewayState(rawCache);
@@ -639,6 +678,7 @@ async function handlePostTool(input, opts) {
   switch (swAction) {
     case "start": {
       activate(opts.sessionDir);
+      resetStopContinuation(opts.sessionDir);
       if (opts.apiKey) {
         const raw = await gwCall(
           opts.gwUrl,
@@ -647,6 +687,7 @@ async function handlePostTool(input, opts) {
         );
         if (raw) {
           writeCache(opts.sessionDir, raw);
+          if (raw.run_id) writeFileSync(join(opts.sessionDir, ".run_id"), raw.run_id);
           const cache = parseGatewayState(raw);
           return {
             hookSpecificOutput: {
@@ -693,6 +734,11 @@ async function handlePostTool(input, opts) {
       );
       if (!raw) return null;
       writeCache(opts.sessionDir, raw);
+      const transitionAdvanced = typeof prevRaw?.transition_count === "number" && typeof raw.transition_count === "number" && raw.transition_count > prevRaw.transition_count;
+      const transitionReported = parsedResult.transitioned === true || parsedResult.forced === true || parsedResult.forked === true || parsedResult.joined === true || parsedResult.failed === true || typeof parsedResult.branch_completed === "string" || typeof parsedResult.subflow_started === "string" || parsedResult.subflow_completed === true;
+      if (transitionAdvanced || transitionReported) {
+        advanceStopEpoch(opts.sessionDir);
+      }
       const cache = parseGatewayState(raw);
       if (raw.pending_approval) {
         const message = raw.pending_approval.message ?? "Human review required.";
@@ -785,7 +831,7 @@ async function handleStop(_input, opts) {
       };
     }
   }
-  return null;
+  if (process.env.STATEWRIGHT_STOP_CONTINUATION === "0") return null;
   if (!isActive(opts.sessionDir)) return null;
   let raw = readCache(opts.sessionDir);
   if (!raw && opts.apiKey) {
@@ -796,13 +842,24 @@ async function handleStop(_input, opts) {
   const cache = parseGatewayState(raw);
   if (cache.isFinal) {
     deactivate(opts.sessionDir);
-    return {
-      hookSpecificOutput: {
-        hookEventName: "Stop",
-        additionalContext: `[statewright] Workflow complete. Final state: ${cache.state}. Enforcement deactivated.`
-      }
-    };
+    return null;
   }
+  if (raw.pending_approval?.approval_id) return null;
+  const runId = raw.run_id ?? "";
+  let localRunId = "";
+  try {
+    localRunId = readFileSync(join(opts.sessionDir, ".run_id"), "utf8").trim();
+  } catch {
+  }
+  if (runId && localRunId && runId !== localRunId) return null;
+  const epoch = readCounter(opts.sessionDir, ".stop_epoch", 1);
+  const progress = readCounter(opts.sessionDir, ".stop_progress");
+  const prior = readStopNudgeLedger(opts.sessionDir);
+  const sameEpoch = prior?.runId === runId && prior.epoch === epoch;
+  if (sameEpoch && prior.progress === progress) return null;
+  const nudges = sameEpoch ? prior.nudges : 0;
+  if (nudges >= STOP_NUDGE_LIMIT) return null;
+  writeStopNudgeLedger(opts.sessionDir, { runId, epoch, progress, nudges: nudges + 1 });
   const continuation = `${formatStateContext(cache)} CONTINUATION REQUIRED: Codex attempted to stop while Statewright is still active in '${cache.state}'. Do not send a final response or wait for a new user prompt. Continue immediately with only the state-allowed tools, complete this phase, and call statewright_transition when its exit criteria are met.`;
   return {
     decision: "block",

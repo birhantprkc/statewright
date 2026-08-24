@@ -102,6 +102,7 @@ interface GatewayState {
   default_model?: string | null
   thinking_level?: string | null
   run_id?: string
+  transition_count?: number
   capture_output?: boolean
   pending_approval?: { approval_id: string; message?: string | null }
   meta?: {
@@ -550,6 +551,9 @@ function deactivate(sessionDir: string): void {
     ".capture_enabled",
     ".run_id",
     ".log_seq",
+    ".stop_epoch",
+    ".stop_progress",
+    ".stop_nudges",
   ]
   for (const f of files) {
     try {
@@ -558,6 +562,54 @@ function deactivate(sessionDir: string): void {
       // ignore missing
     }
   }
+}
+
+const STOP_NUDGE_LIMIT = 3
+
+function readCounter(sessionDir: string, file: string, fallback = 0): number {
+  try {
+    const value = Number.parseInt(readFileSync(join(sessionDir, file), "utf8").trim(), 10)
+    return Number.isSafeInteger(value) && value >= 0 ? value : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function resetStopContinuation(sessionDir: string, epoch = 1): void {
+  mkdirSync(sessionDir, { recursive: true })
+  writeFileSync(join(sessionDir, ".stop_epoch"), String(epoch))
+  writeFileSync(join(sessionDir, ".stop_progress"), "0")
+  try { unlinkSync(join(sessionDir, ".stop_nudges")) } catch { /* missing is fine */ }
+}
+
+function recordStopProgress(sessionDir: string): void {
+  writeFileSync(join(sessionDir, ".stop_progress"), String(readCounter(sessionDir, ".stop_progress") + 1))
+}
+
+function advanceStopEpoch(sessionDir: string): void {
+  resetStopContinuation(sessionDir, readCounter(sessionDir, ".stop_epoch", 0) + 1)
+}
+
+interface StopNudgeLedger {
+  runId: string
+  epoch: number
+  progress: number
+  nudges: number
+}
+
+function readStopNudgeLedger(sessionDir: string): StopNudgeLedger | null {
+  try {
+    const parsed = JSON.parse(readFileSync(join(sessionDir, ".stop_nudges"), "utf8")) as StopNudgeLedger
+    return typeof parsed.runId === "string" && Number.isSafeInteger(parsed.epoch) &&
+      Number.isSafeInteger(parsed.progress) && Number.isSafeInteger(parsed.nudges)
+      ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function writeStopNudgeLedger(sessionDir: string, ledger: StopNudgeLedger): void {
+  writeFileSync(join(sessionDir, ".stop_nudges"), JSON.stringify(ledger))
 }
 
 // --- Hook handlers (exported for testing) ---
@@ -878,6 +930,9 @@ export async function handlePostTool(
 
   // Interrupt detection for file-changing tools (when active, no sw action)
   if (!swAction && isActive(opts.sessionDir)) {
+    // This is deliberately local and independent of API/telemetry success.
+    // A Stop hook may only nudge after real work occurred since its last nudge.
+    recordStopProgress(opts.sessionDir)
     const rawCache = readCache(opts.sessionDir)
     if (rawCache) {
       const cache = parseGatewayState(rawCache)
@@ -922,6 +977,7 @@ export async function handlePostTool(
   switch (swAction) {
     case "start": {
       activate(opts.sessionDir)
+      resetStopContinuation(opts.sessionDir)
 
       // Fetch and cache initial state
       if (opts.apiKey) {
@@ -932,6 +988,7 @@ export async function handlePostTool(
         )
         if (raw) {
           writeCache(opts.sessionDir, raw)
+          if (raw.run_id) writeFileSync(join(opts.sessionDir, ".run_id"), raw.run_id)
           const cache = parseGatewayState(raw)
           return {
             hookSpecificOutput: {
@@ -988,6 +1045,22 @@ export async function handlePostTool(
       if (!raw) return null
 
       writeCache(opts.sessionDir, raw)
+      const transitionAdvanced =
+        typeof prevRaw?.transition_count === "number" &&
+        typeof raw.transition_count === "number" &&
+        raw.transition_count > prevRaw.transition_count
+      const transitionReported =
+        parsedResult.transitioned === true ||
+        parsedResult.forced === true ||
+        parsedResult.forked === true ||
+        parsedResult.joined === true ||
+        parsedResult.failed === true ||
+        typeof parsedResult.branch_completed === "string" ||
+        typeof parsedResult.subflow_started === "string" ||
+        parsedResult.subflow_completed === true
+      if (transitionAdvanced || transitionReported) {
+        advanceStopEpoch(opts.sessionDir)
+      }
       const cache = parseGatewayState(raw)
       if (raw.pending_approval) {
         const message = raw.pending_approval.message ?? "Human review required."
@@ -1096,9 +1169,7 @@ export async function handleStop(
     }
   }
 
-  // Approval gates are delivered by PostToolUse so Codex can present its own
-  // review UI. Never suppress that UI from Stop.
-  return null
+  if (process.env.STATEWRIGHT_STOP_CONTINUATION === "0") return null
 
   // A Stop hook fires when Codex is about to yield a final response.  Unlike
   // UserPromptSubmit, it can keep an autonomous workflow alive without a
@@ -1121,13 +1192,26 @@ export async function handleStop(
   const cache = parseGatewayState(raw)
   if (cache.isFinal) {
     deactivate(opts.sessionDir)
-    return {
-      hookSpecificOutput: {
-        hookEventName: "Stop",
-        additionalContext: `[statewright] Workflow complete. Final state: ${cache.state}. Enforcement deactivated.`,
-      },
-    }
+    return null
   }
+
+  // Approval gates are delivered by PostToolUse so Codex can present its own
+  // review UI. Never suppress that UI from Stop.
+  if (raw.pending_approval?.approval_id) return null
+
+  const runId = raw.run_id ?? ""
+  let localRunId = ""
+  try { localRunId = readFileSync(join(opts.sessionDir, ".run_id"), "utf8").trim() } catch { /* optional */ }
+  if (runId && localRunId && runId !== localRunId) return null
+
+  const epoch = readCounter(opts.sessionDir, ".stop_epoch", 1)
+  const progress = readCounter(opts.sessionDir, ".stop_progress")
+  const prior = readStopNudgeLedger(opts.sessionDir)
+  const sameEpoch = prior?.runId === runId && prior.epoch === epoch
+  if (sameEpoch && prior.progress === progress) return null
+  const nudges = sameEpoch ? prior.nudges : 0
+  if (nudges >= STOP_NUDGE_LIMIT) return null
+  writeStopNudgeLedger(opts.sessionDir, { runId, epoch, progress, nudges: nudges + 1 })
 
   const continuation = `${formatStateContext(cache)} CONTINUATION REQUIRED: Codex attempted to stop while Statewright is still active in '${cache.state}'. Do not send a final response or wait for a new user prompt. Continue immediately with only the state-allowed tools, complete this phase, and call statewright_transition when its exit criteria are met.`
   return {

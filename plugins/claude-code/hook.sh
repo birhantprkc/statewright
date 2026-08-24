@@ -114,7 +114,45 @@ project_claude_transcript_usage() {
 }
 
 clear_session_telemetry_state() {
-  rm -f "$ACTIVE_FILE" "$CACHE_FILE" "$PROJECT_DIR/.session_hinted" "$PROJECT_DIR/.discovered_commands" "$PROJECT_DIR/.capture_enabled" "$PROJECT_DIR/.run_id" "$PROJECT_DIR/.log_seq" "$PROJECT_DIR/.state_epoch" "$PROJECT_DIR/.claude_transcript_usage.json"
+  rm -f "$ACTIVE_FILE" "$CACHE_FILE" "$PROJECT_DIR/.session_hinted" "$PROJECT_DIR/.discovered_commands" "$PROJECT_DIR/.capture_enabled" "$PROJECT_DIR/.run_id" "$PROJECT_DIR/.log_seq" "$PROJECT_DIR/.state_epoch" "$PROJECT_DIR/.claude_transcript_usage.json" "$PROJECT_DIR/.stop_progress" "$PROJECT_DIR/.stop_nudges"
+}
+
+# Stop continuation is local policy, so liveness does not depend on API or
+# telemetry success. State transitions reset the nudge budget for their epoch.
+reset_stop_continuation_state() {
+  echo "0" > "$PROJECT_DIR/.stop_progress"
+  rm -f "$PROJECT_DIR/.stop_nudges"
+}
+
+record_stop_progress() {
+  local progress
+  progress=$(cat "$PROJECT_DIR/.stop_progress" 2>/dev/null || echo "0")
+  case "$progress" in ''|*[!0-9]*) progress=0 ;; esac
+  echo $((progress + 1)) > "$PROJECT_DIR/.stop_progress"
+}
+
+allow_stop_nudge() {
+  local state_json="$1" run_id local_run_id epoch progress prior_run prior_epoch prior_progress prior_nudges nudges
+  run_id=$(echo "$state_json" | jq -r '.run_id // empty' 2>/dev/null || true)
+  local_run_id=$(cat "$PROJECT_DIR/.run_id" 2>/dev/null || true)
+  [ -n "$run_id" ] && [ -n "$local_run_id" ] && [ "$run_id" != "$local_run_id" ] && return 1
+  epoch=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "1")
+  progress=$(cat "$PROJECT_DIR/.stop_progress" 2>/dev/null || echo "0")
+  case "$epoch" in ''|*[!0-9]*) epoch=1 ;; esac
+  case "$progress" in ''|*[!0-9]*) progress=0 ;; esac
+  if [ -f "$PROJECT_DIR/.stop_nudges" ]; then
+    IFS='|' read -r prior_run prior_epoch prior_progress prior_nudges < "$PROJECT_DIR/.stop_nudges" || true
+  fi
+  if [ "$prior_run" = "$run_id" ] && [ "$prior_epoch" = "$epoch" ]; then
+    [ "$prior_progress" = "$progress" ] && return 1
+    case "$prior_nudges" in ''|*[!0-9]*) prior_nudges=0 ;; esac
+    [ "$prior_nudges" -ge 3 ] && return 1
+    nudges=$((prior_nudges + 1))
+  else
+    nudges=1
+  fi
+  printf '%s|%s|%s|%s\n' "$run_id" "$epoch" "$progress" "$nudges" > "$PROJECT_DIR/.stop_nudges"
+  return 0
 }
 
 # A managed supervisor owns a dedicated Claude process group. Hooks only write
@@ -578,6 +616,9 @@ case "$ENDPOINT" in
         if [ -n "$STATE_JSON" ]; then
           echo "$STATE_JSON" > "$CACHE_FILE"
           echo "1" > "$PROJECT_DIR/.state_epoch"
+          reset_stop_continuation_state
+          RUN_ID_STATE=$(echo "$STATE_JSON" | jq -r '.run_id // empty' 2>/dev/null || true)
+          [ -n "$RUN_ID_STATE" ] && echo "$RUN_ID_STATE" > "$PROJECT_DIR/.run_id"
         fi
         mkdir -p "$STATEWRIGHT_DIR/logs"
         project_claude_transcript_usage
@@ -604,11 +645,12 @@ case "$ENDPOINT" in
         ;;
       stop)
         # Deactivate enforcement
-        rm -f "$ACTIVE_FILE" "$CACHE_FILE" "$PROJECT_DIR/.session_hinted" "$PROJECT_DIR/.discovered_commands" "$PROJECT_DIR/.capture_enabled" "$PROJECT_DIR/.run_id" "$PROJECT_DIR/.log_seq" "$PROJECT_DIR/.state_epoch" "$PROJECT_DIR/.claude_transcript_usage.json"
+        rm -f "$ACTIVE_FILE" "$CACHE_FILE" "$PROJECT_DIR/.session_hinted" "$PROJECT_DIR/.discovered_commands" "$PROJECT_DIR/.capture_enabled" "$PROJECT_DIR/.run_id" "$PROJECT_DIR/.log_seq" "$PROJECT_DIR/.state_epoch" "$PROJECT_DIR/.claude_transcript_usage.json" "$PROJECT_DIR/.stop_progress" "$PROJECT_DIR/.stop_nudges"
         ;;
       transition)
         # Read previous state before refreshing
         PREV_STATE=$(cat "$CACHE_FILE" 2>/dev/null | jq -r '.state // empty' 2>/dev/null || true)
+        PREV_TRANSITION_COUNT=$(cat "$CACHE_FILE" 2>/dev/null | jq -r '.transition_count // empty' 2>/dev/null || true)
 
         # Check for fork/join results in tool output
         PARSED_RESULT=""
@@ -625,11 +667,28 @@ case "$ENDPOINT" in
         if [ -n "$STATE_JSON" ]; then
           echo "$STATE_JSON" > "$CACHE_FILE"
           NEW_STATE=$(echo "$STATE_JSON" | jq -r '.state // empty' 2>/dev/null || true)
+          NEW_TRANSITION_COUNT=$(echo "$STATE_JSON" | jq -r '.transition_count // empty' 2>/dev/null || true)
           IS_FINAL=$(echo "$STATE_JSON" | jq -r '.is_final // false' 2>/dev/null || true)
           [ "$IS_FINAL" = "true" ] || request_interactive_route_restart "$STATE_JSON"
-          PREV_EPOCH=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "0")
-          case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
-          echo $((PREV_EPOCH + 1)) > "$PROJECT_DIR/.state_epoch"
+          TRANSITION_SUCCEEDED=false
+          case "$PREV_TRANSITION_COUNT" in
+            ''|*[!0-9]*) ;;
+            *)
+              case "$NEW_TRANSITION_COUNT" in
+                ''|*[!0-9]*) ;;
+                *) [ "$NEW_TRANSITION_COUNT" -gt "$PREV_TRANSITION_COUNT" ] && TRANSITION_SUCCEEDED=true ;;
+              esac
+              ;;
+          esac
+          if [ "$TRANSITION_SUCCEEDED" != "true" ] && [ "$(echo "$PARSED_RESULT" | jq -r 'if (.transitioned == true or .forced == true or .forked == true or .joined == true or .failed == true or (.branch_completed? != null) or (.subflow_started? != null) or (.subflow_completed? != null)) then "true" else "false" end' 2>/dev/null || true)" = "true" ]; then
+            TRANSITION_SUCCEEDED=true
+          fi
+          if [ "$TRANSITION_SUCCEEDED" = "true" ]; then
+            PREV_EPOCH=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "0")
+            case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
+            echo $((PREV_EPOCH + 1)) > "$PROJECT_DIR/.state_epoch"
+            reset_stop_continuation_state
+          fi
 
           if [ "$IS_FORK" = "true" ]; then
             # Fork transition — show branches and agent coordination instructions
@@ -689,6 +748,9 @@ case "$ENDPOINT" in
         fi
         ;;
     esac
+    if [ -f "$ACTIVE_FILE" ] && [ -z "$SW_ACTION" ]; then
+      record_stop_progress
+    fi
     exit 0
     ;;
 
@@ -709,9 +771,7 @@ case "$ENDPOINT" in
     mkdir -p "$STATEWRIGHT_DIR/logs"
     project_claude_transcript_usage
 
-    # Review gates are surfaced from PostToolUse. Stop must not suppress the
-    # host UI's prompt or an external review integration.
-    exit 0
+    [ "${STATEWRIGHT_STOP_CONTINUATION:-1}" = "0" ] && exit 0
 
     # Stop is the point at which Claude is about to yield. While a workflow is
     # nonfinal, block that yield and return the phase context so Claude can
@@ -746,6 +806,10 @@ case "$ENDPOINT" in
       # the session-scoped telemetry files.
       exit 0
     fi
+
+    # Approval UI is owned by PostToolUse (or its external channel).
+    [ -n "$(echo "$STATE_JSON" | jq -r '.pending_approval.approval_id // empty' 2>/dev/null || true)" ] && exit 0
+    allow_stop_nudge "$STATE_JSON" || exit 0
 
     ITER=$(echo "$STATE_JSON" | jq -r '.iteration // 0' 2>/dev/null || true)
     MAX=$(echo "$STATE_JSON" | jq -r '.max_iterations // "none"' 2>/dev/null || true)

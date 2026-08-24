@@ -812,6 +812,24 @@ describe("handlePostTool", () => {
     expect(result!.hookSpecificOutput!.additionalContext).toContain("KEEP WORKING")
   })
 
+  it("does not reset the Stop epoch after a rejected transition", async () => {
+    ;(existsSync as Mock).mockImplementation((p: string) =>
+      p.includes(".active") || p.includes(".state_cache") ? true : false,
+    )
+    ;(readFileSync as Mock).mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes(".state_cache")) return JSON.stringify(MOCK_GW_STATE)
+      throw new Error("ENOENT")
+    })
+    setupGateway()
+
+    await handlePostTool({
+      tool_name: "mcp__plugin_statewright_statewright__statewright_transition",
+      tool_response: JSON.stringify([{ type: "text", text: JSON.stringify({ transitioned: false }) }]),
+    }, makeOpts())
+
+    expect(writeFileSync).not.toHaveBeenCalledWith(expect.stringContaining(".stop_epoch"), expect.any(String))
+  })
+
   it("detects fork transition", async () => {
     ;(existsSync as Mock).mockReturnValue(true)
     ;(readFileSync as Mock).mockImplementation((p: string) => {
@@ -983,13 +1001,14 @@ describe("handleStop", () => {
     expect(result!.reason).toContain("Continue state testing")
   })
 
-  it("does not suppress the host review UI when the workflow is nonfinal", async () => {
+  it("nudges a standalone nonfinal workflow once", async () => {
     ;(existsSync as Mock).mockImplementation((p: string) => p.includes(".active"))
     setupGateway()
 
     const result = await handleStop({}, makeOpts())
 
-    expect(result).toBeNull()
+    expect(result!.decision).toBe("block")
+    expect(result!.reason).toContain("continue until a final state")
   })
 
   it("does not intercept stopping at a final state", async () => {
@@ -1001,15 +1020,39 @@ describe("handleStop", () => {
     expect(result).toBeNull()
   })
 
-  it("does not create a stop loop when the gateway is unavailable", async () => {
-    ;(existsSync as Mock).mockImplementation((p: string) =>
-      p.includes(".active") || p.includes(".state_cache"),
-    )
+  it("allows a duplicate Stop without ordinary tool progress", async () => {
+    ;(existsSync as Mock).mockImplementation((p: string) => p.includes(".active") || p.includes(".state_cache") || p.includes(".stop_epoch") || p.includes(".stop_progress") || p.includes(".stop_nudges"))
     ;(readFileSync as Mock).mockImplementation((p: string) => {
       if (typeof p === "string" && p.includes(".state_cache")) return JSON.stringify(MOCK_GW_STATE)
+      if (typeof p === "string" && p.includes(".stop_epoch")) return "1"
+      if (typeof p === "string" && p.includes(".stop_progress")) return "0"
+      if (typeof p === "string" && p.includes(".stop_nudges")) return JSON.stringify({ runId: "", epoch: 1, progress: 0, nudges: 1 })
       throw new Error("ENOENT")
     })
-    setupFetch(() => null)
+
+    const result = await handleStop({}, makeOpts())
+
+    expect(result).toBeNull()
+  })
+
+  it("allows a Stop when approval is pending", async () => {
+    ;(existsSync as Mock).mockImplementation((p: string) => p.includes(".active"))
+    setupGateway({ ...MOCK_GW_STATE, pending_approval: { approval_id: "approval-1" } })
+
+    const result = await handleStop({}, makeOpts())
+
+    expect(result).toBeNull()
+  })
+
+  it("allows a Stop after the per-epoch nudge cap", async () => {
+    ;(existsSync as Mock).mockImplementation((p: string) => p.includes(".active") || p.includes(".state_cache") || p.includes(".stop_epoch") || p.includes(".stop_progress") || p.includes(".stop_nudges"))
+    ;(readFileSync as Mock).mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes(".state_cache")) return JSON.stringify(MOCK_GW_STATE)
+      if (typeof p === "string" && p.includes(".stop_epoch")) return "1"
+      if (typeof p === "string" && p.includes(".stop_progress")) return "4"
+      if (typeof p === "string" && p.includes(".stop_nudges")) return JSON.stringify({ runId: "", epoch: 1, progress: 3, nudges: 3 })
+      throw new Error("ENOENT")
+    })
 
     const result = await handleStop({}, makeOpts())
 
