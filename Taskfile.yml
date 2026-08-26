@@ -4,6 +4,14 @@ vars:
   CARGO: "{{.HOME}}/.cargo/bin/cargo"
 
 tasks:
+  plugins:sync-error-reporting:
+    desc: "Refresh the privacy-safe Sentry reporter shipped with each Node plugin"
+    cmds:
+      - node plugins/executor/scripts/sync-error-reporting.mjs
+      - npm run build --prefix plugins/omx
+      - node plugins/executor/scripts/sync-error-reporting.mjs --check
+      - npm test --prefix plugins/omx -- --run tests/error-reporting-bundle.spec.ts
+
   plugins:sync-executor-core:
     desc: "Refresh the Codex marketplace copy of the shared executor core"
     cmds:

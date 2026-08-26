@@ -14,9 +14,13 @@ const PLUGIN_VERSION = "0.3.0"
 const MAX_ADAPTER_ERROR_BYTES = 4 * 1024
 
 import type { Plugin } from "@opencode-ai/plugin"
+import { createErrorReporter } from "./error-reporting.mjs"
 import { readFileSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
+
+const errorReporter = createErrorReporter({ plugin: PLUGIN_NAME, version: PLUGIN_VERSION })
+errorReporter.installProcessHandlers()
 
 interface HookResponse {
   decision?: string
@@ -340,6 +344,7 @@ function createStatewrightHooks(
           path: { id: sessionId },
           body: continuationBody(state),
         }).catch(async (error) => {
+          await errorReporter.report(error, { mechanism: "hook_callback", operation: "session_continue", host: "opencode" })
           continuedStateBySession.delete(sessionId)
           await showToast(
             client,
@@ -445,6 +450,7 @@ const pluginFactory: Plugin = async ({ client }) => {
         throw new Error("[statewright] Executor adapter did not acknowledge plugin readiness.")
       }
     } catch (error) {
+      await errorReporter.report(error, { mechanism: "entrypoint", operation: "adapter_ready", host: "opencode" })
       console.error(error)
       return createUnavailableHooks(error)
     }

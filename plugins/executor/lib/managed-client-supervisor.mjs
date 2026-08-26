@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { ManagedMcpBridge } from "./managed-mcp-bridge.mjs";
 import { bindManagedClientIdentity, resolveManagedClientIdentity, writeManagedControlIdentity } from "./managed-client-identity.mjs";
 import { resolveApiKey } from "./remote-client.mjs";
+import { createErrorReporter, isExpectedExit } from "./error-reporting.mjs";
 
 const CONTINUATION_PROMPT = "Continue the active Statewright workflow in its current state. Use statewright_get_state first.";
 const EXECUTOR_ROOT = dirname(fileURLToPath(import.meta.url));
@@ -353,7 +354,7 @@ async function nextRouteRequest(controlDir, consumed) {
   return null;
 }
 
-export async function runManagedClient({ host, command, args, environment = process.env, cwd = process.cwd(), home = homedir(), pollMs = 100, bridgeFactory = (options) => new ManagedMcpBridge(options) }) {
+export async function runManagedClient({ host, command, args, environment = process.env, cwd = process.cwd(), home = homedir(), pollMs = 100, bridgeFactory = (options) => new ManagedMcpBridge(options), reporter = createErrorReporter({ plugin: host === "claude" ? "claude-code" : "codex", version: "0.3.0", environment }) }) {
   if (!["codex", "claude"].includes(host)) throw new Error(`Unsupported managed client host '${host}'.`);
   const cmdShim = await resolveWindowsCmdShim(command);
   const launchCommand = cmdShim?.command ?? command;
@@ -399,7 +400,11 @@ export async function runManagedClient({ host, command, args, environment = proc
           },
           stdio: "inherit",
         });
-        return (await waitForExit(tui)).code ?? 1;
+        const result = await waitForExit(tui);
+        if (!isExpectedExit(result)) await reporter.report(new Error("Native Codex connected to its resident App Server exited unexpectedly."), {
+          mechanism: "child_exit", host, operation: "resident_tui", exit_code: result.code ?? 1, signal: result.signal,
+        });
+        return result.code ?? 1;
       }
     }
     bridge = await createManagedMcpBridge({ environment, clientId: routedClientId, bridgeFactory });
@@ -465,7 +470,12 @@ export async function runManagedClient({ host, command, args, environment = proc
         await delay(pollMs);
       }
       const result = await exit;
-      if (!restart) return result.code ?? 1;
+      if (!restart) {
+        if (!isExpectedExit(result)) await reporter.report(new Error(`Managed ${host} client exited unexpectedly.`), {
+          mechanism: "child_exit", host, operation: "managed_client", exit_code: result.code ?? 1, signal: result.signal,
+        });
+        return result.code ?? 1;
+      }
     }
   } finally {
     await telemetry?.release();

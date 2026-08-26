@@ -4,6 +4,7 @@ import { chmod, cp, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/pro
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { startCodexAppServerRouteProxy } from "./codex-app-server-route-proxy.mjs";
+import { createErrorReporter, isExpectedExit, isExpectedTransportClose } from "./error-reporting.mjs";
 
 const DEFAULT_READY_TIMEOUT_MS = 10_000;
 
@@ -115,6 +116,7 @@ export async function runCodexAppServerTransport({
   pollMs = 100,
   stderr = process.stderr,
   telemetry = async () => {},
+  reporter = createErrorReporter({ plugin: "codex", version: "0.3.0", environment }),
 }) {
   let pendingRoute = null;
   const runtime = await startCodexAppServerRuntime({
@@ -130,6 +132,7 @@ export async function runCodexAppServerTransport({
     },
     stderr,
     telemetry,
+    reporter,
   });
   let tui;
   try {
@@ -140,7 +143,7 @@ export async function runCodexAppServerTransport({
     });
     const tuiExit = new Promise((resolveExit, rejectExit) => {
       tui.once("error", rejectExit);
-      tui.once("exit", (code) => resolveExit(code ?? 1));
+      tui.once("exit", (code, signal) => resolveExit({ code, signal }));
     });
     let exited = false;
     tui.once("exit", () => { exited = true; });
@@ -152,7 +155,11 @@ export async function runCodexAppServerTransport({
       }
       await delay(pollMs);
     }
-    return await tuiExit;
+    const result = await tuiExit;
+    if (!isExpectedExit(result)) await reporter.report(new Error("Native Codex TUI exited unexpectedly."), {
+      mechanism: "child_exit", host: "codex", operation: "native_tui", exit_code: result.code ?? 1, signal: result.signal,
+    });
+    return result.code ?? 1;
   } finally {
     if (tui && tui.exitCode === null) tui.kill("SIGTERM");
     await runtime.close();
@@ -173,6 +180,7 @@ export async function startCodexAppServerRuntime({
   nextRouteRequest = async () => null,
   stderr = process.stderr,
   telemetry = async () => {},
+  reporter = createErrorReporter({ plugin: "codex", version: "0.3.0", environment }),
 }) {
   const codexHome = environment.CODEX_HOME ?? join(home, ".codex");
   const port = await reserveLoopbackPort();
@@ -186,6 +194,15 @@ export async function startCodexAppServerRuntime({
   });
   appServer.stderr.on("data", (chunk) => stderr.write(chunk));
   appServer.stdout.resume();
+  let closing = false;
+  appServer.once("error", (error) => { void reporter.report(error, { mechanism: "child_spawn", host: "codex", operation: "app_server" }); });
+  appServer.once("exit", (code, signal) => {
+    if (!isExpectedExit({ code, signal, shuttingDown: closing })) {
+      void reporter.report(new Error("Codex App Server exited unexpectedly."), {
+        mechanism: "child_exit", host: "codex", operation: "app_server", exit_code: code ?? 1, signal,
+      });
+    }
+  });
 
   try {
     await waitForReady(url, appServer);
@@ -206,7 +223,17 @@ export async function startCodexAppServerRuntime({
         if (!direction) stderr.write("[statewright] native Codex connected to the App Server proxy.\n");
         else stderr.write(`[statewright] App Server proxy ${direction}: ${method ?? upstreamUrl ?? "connection"}${bytes ? ` (${bytes} bytes)` : ""}${resultKeys ? ` [${resultKeys.join(",")}]` : ""}.\n`);
       },
-      onTransportError: async ({ side, message }) => stderr.write(`[statewright] App Server proxy ${side} transport error: ${message}.\n`),
+      onTransportError: async ({ side, message, code }) => {
+        stderr.write(`[statewright] App Server proxy ${side} transport error: ${message}.\n`);
+        if (!closing && !isExpectedTransportClose({ side, code })) await reporter.report(new Error(message), {
+          mechanism: "transport", host: "codex", operation: "app_server_proxy", transport: "websocket", side, close_code: code,
+        });
+      },
+      onProtocolError: async ({ side, message }) => {
+        if (!closing) await reporter.report(new Error(message), {
+          mechanism: "protocol", host: "codex", operation: "app_server_proxy", transport: "websocket", side,
+        });
+      },
     });
     const ready = await fetch(`${routeProxy.url.replace(/^ws/, "http")}/readyz`);
     if (!ready.ok) throw new Error("Statewright App Server proxy did not become ready.");
@@ -215,12 +242,14 @@ export async function startCodexAppServerRuntime({
       proxyUrl: routeProxy.url,
       upstreamUrl: url,
       async close() {
+        closing = true;
         await routeProxy.close();
         if (appServer.exitCode === null) appServer.kill("SIGTERM");
         await rm(appServerHome, { recursive: true, force: true });
       },
     };
   } catch (error) {
+    closing = true;
     if (appServer.exitCode === null) appServer.kill("SIGTERM");
     await rm(appServerHome, { recursive: true, force: true });
     throw error;

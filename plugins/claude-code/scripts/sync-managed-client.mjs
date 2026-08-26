@@ -9,6 +9,7 @@ const CLAUDE_ROOT = resolve(SCRIPT_ROOT, "..");
 const EXECUTOR_ROOT = resolve(CLAUDE_ROOT, "..", "executor");
 
 export const MANAGED_CLIENT_FILES = [
+  ["lib/error-reporting.mjs", "executor/lib/error-reporting.mjs"],
   ["statewright-managed-client.mjs", "executor/statewright-managed-client.mjs"],
   ["lib/managed-client-supervisor.mjs", "executor/lib/managed-client-supervisor.mjs"],
   ["lib/managed-client-identity.mjs", "executor/lib/managed-client-identity.mjs"],

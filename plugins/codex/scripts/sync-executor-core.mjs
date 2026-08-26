@@ -9,6 +9,7 @@ const CODEX_ROOT = resolve(SCRIPT_ROOT, "..");
 const EXECUTOR_ROOT = resolve(CODEX_ROOT, "..", "executor");
 
 export const EXECUTOR_CORE_FILES = [
+  ["lib/error-reporting.mjs", "scripts/lib/error-reporting.mjs"],
   ["lib/delivery-config.mjs", "scripts/lib/delivery-config.mjs"],
   ["lib/delivery-controller.mjs", "scripts/lib/delivery-controller.mjs"],
   ["lib/hook-process.mjs", "scripts/lib/hook-process.mjs"],

@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { bootstrapManagedClients, installManagedClientShim, managedClientEnabled, runManagedClient, setManagedClientEnabled, uninstallManagedClients } from "./lib/managed-client-supervisor.mjs";
+import { createErrorReporter, isExpectedExit, isExpectedPluginError } from "./lib/error-reporting.mjs";
 
 const launcherPath = fileURLToPath(import.meta.url);
 
@@ -34,6 +35,8 @@ function usage() {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  const reporter = createErrorReporter({ plugin: options.host === "claude" ? "claude-code" : "codex", version: "0.3.0" });
+  reporter.installProcessHandlers();
   if (options.help) return process.stdout.write(`${usage()}\n`);
   if (options.bootstrap) {
     process.stdout.write(`${JSON.stringify(await bootstrapManagedClients({ launcherPath }))}\n`);
@@ -64,7 +67,7 @@ async function main() {
   }
   if (!options.realBin) throw new Error("--real-bin is required when launching a managed client.");
   if (await managedClientEnabled(options.host)) {
-    process.exitCode = await runManagedClient({ host: options.host, command: options.realBin, args: options.args });
+    process.exitCode = await runManagedClient({ host: options.host, command: options.realBin, args: options.args, reporter });
     return;
   }
   const child = spawn(options.realBin, options.args, {
@@ -73,12 +76,21 @@ async function main() {
     cwd: process.cwd(),
     shell: process.platform === "win32",
   });
-  process.exitCode = await new Promise((resolveExit, rejectExit) => {
+  const result = await new Promise((resolveExit, rejectExit) => {
     child.once("error", rejectExit);
-    child.once("exit", (code) => resolveExit(code ?? 1));
+    child.once("exit", (code, signal) => resolveExit({ code: code ?? 1, signal }));
   });
+  if (!isExpectedExit(result)) await reporter.report(new Error(`Unmanaged ${options.host} client exited unexpectedly.`), {
+    mechanism: "child_exit", host: options.host, operation: "unmanaged_client", exit_code: result.code, signal: result.signal,
+  });
+  process.exitCode = result.code;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === launcherPath) {
-  main().catch((error) => { process.stderr.write(`[statewright] ${error.message}\n`); process.exitCode = 2; });
+  main().catch(async (error) => {
+    const reporter = createErrorReporter({ plugin: "managed-client", version: "0.3.0" });
+    if (!isExpectedPluginError(error)) await reporter.report(error, { mechanism: "entrypoint", operation: "managed_client" });
+    process.stderr.write(`[statewright] ${error.message}\n`);
+    process.exitCode = 2;
+  });
 }

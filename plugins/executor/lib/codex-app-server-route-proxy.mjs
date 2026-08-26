@@ -84,6 +84,7 @@ export async function startCodexAppServerRouteProxy({
   onRouteConfirmed = async () => {},
   onConnection = async () => {},
   onTransportError = async () => {},
+  onProtocolError = async () => {},
   compactResume = true,
   resumeHistoryLimit = 4,
 }) {
@@ -131,6 +132,7 @@ export async function startCodexAppServerRouteProxy({
           }
         }
       } catch (error) {
+        void onProtocolError({ side: "native_to_upstream", message: error instanceof Error ? error.message : String(error) });
         downstream.close(1011, `Statewright route proxy failed: ${error.message}`);
         return;
       }
@@ -157,9 +159,10 @@ export async function startCodexAppServerRouteProxy({
           receipts.delete(receipt.threadId);
           await onRouteConfirmed(receipt);
         }
-      } catch {
+      } catch (error) {
         // Protocol traffic is still forwarded; receipt telemetry must never
         // interfere with a native Codex session.
+        void onProtocolError({ side: "upstream_to_native", message: error instanceof Error ? error.message : String(error) });
       }
       // App Server WebSocket mode specifies one JSON-RPC text frame per
       // message. `ws` exposes received text as a Buffer by default; sending
@@ -172,7 +175,7 @@ export async function startCodexAppServerRouteProxy({
       if (downstream.readyState === WebSocket.OPEN || downstream.readyState === WebSocket.CONNECTING) downstream.close();
     };
     downstream.on("close", (code, reason) => {
-      void onTransportError({ side: "native_close", message: `${code} ${String(reason)}`.trim() });
+      void onTransportError({ side: "native_close", code, message: `${code} ${String(reason)}`.trim() });
       closePeer();
     });
     downstream.on("error", (error) => {
@@ -180,7 +183,7 @@ export async function startCodexAppServerRouteProxy({
       closePeer();
     });
     upstream.on("close", (code, reason) => {
-      void onTransportError({ side: "upstream_close", message: `${code} ${String(reason)}`.trim() });
+      void onTransportError({ side: "upstream_close", code, message: `${code} ${String(reason)}`.trim() });
       closePeer();
     });
     upstream.on("error", (error) => {

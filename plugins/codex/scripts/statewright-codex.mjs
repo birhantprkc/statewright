@@ -1,17 +1,7 @@
 #!/usr/bin/env node
 
-import * as Sentry from "@sentry/node";
-
 const PLUGIN_NAME = "codex";
 const PLUGIN_VERSION = "0.3.0";
-
-Sentry.init({
-  dsn: "https://3c30b803a5b44d74bf9657db7a89f033@glitch.enhasa.cloud/12",
-  release: `statewright-${PLUGIN_NAME}@${PLUGIN_VERSION}`,
-  environment: process.env.NODE_ENV || "production",
-});
-Sentry.setTag("plugin", PLUGIN_NAME);
-Sentry.setTag("platform", `${process.platform}-${process.arch}`);
 
 import { readFile, readFile as readFileAsync } from "node:fs/promises";
 import { realpathSync, readFileSync } from "node:fs";
@@ -34,6 +24,10 @@ import {
 } from "./lib/delivery-config.mjs";
 import { DeliveryController } from "./lib/delivery-controller.mjs";
 import { WorkspaceSession } from "./lib/workspace-session.mjs";
+import { createErrorReporter, isExpectedPluginError } from "./lib/error-reporting.mjs";
+
+const errorReporter = createErrorReporter({ plugin: PLUGIN_NAME, version: PLUGIN_VERSION });
+errorReporter.installProcessHandlers();
 
 const HELP = `Usage:
   statewright-codex --workflow NAME [options] -- TASK
@@ -317,7 +311,6 @@ export async function main(argv = process.argv.slice(2)) {
     try {
       const apiKey = process.env.STATEWRIGHT_API_KEY ?? readFileSync(join(homedir(), ".statewright", "api_key"), "utf8").trim()
       const pbUrl = process.env.STATEWRIGHT_PB_URL || "https://statewright.ai"
-      Sentry.setUser({ id: apiKey.slice(0, 8) })
       fetch(`${pbUrl}/api/telemetry/plugin-event`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -356,7 +349,8 @@ if (isMainModule()) {
     (result) => {
       if (result?.status === "approval_required") process.exitCode = 3;
     },
-    (error) => {
+    async (error) => {
+      if (!isExpectedPluginError(error)) await errorReporter.report(error, { mechanism: "entrypoint", operation: "statewright_codex" });
       process.stderr.write(`[statewright] ${error.stack ?? error.message}\n`);
       process.exitCode = 1;
     },

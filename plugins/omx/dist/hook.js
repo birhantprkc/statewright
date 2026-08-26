@@ -9,6 +9,147 @@ import {
 import { join } from "path";
 import { homedir } from "os";
 import { minimatch } from "minimatch";
+
+// src/error-reporting.mjs
+import { randomUUID } from "crypto";
+var DEFAULT_SENTRY_DSN = "https://3c30b803a5b44d74bf9657db7a89f033@glitch.enhasa.cloud/12";
+var MAX_VALUE_BYTES = 2048;
+var SAFE_CONTEXT_FIELDS = /* @__PURE__ */ new Set([
+  "mechanism",
+  "operation",
+  "host",
+  "transport",
+  "side",
+  "close_code",
+  "exit_code",
+  "signal",
+  "phase",
+  "runtime",
+  "reason"
+]);
+var SECRET_PATTERNS = [
+  /\b(?:sw_(?:live|test)_[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_-]+)\b/g,
+  /(authorization\s*[:=]\s*(?:bearer\s+)?)\S+/gi,
+  /\b((?:api[_-]?key|token|secret|password|cookie|session)[A-Za-z0-9_-]*\s*[:=]\s*)[^\s,;]+/gi,
+  /([?&](?:api[_-]?key|token|secret|password|access_token)=)[^&#\s]+/gi,
+  /(["']?(?:prompt|tool_input|tool_response|payload|arguments|messages|content|input|output)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[^,}\]\n]+)/gi
+];
+function redactString(value, limit = MAX_VALUE_BYTES) {
+  let result = String(value ?? "");
+  for (const pattern of SECRET_PATTERNS) {
+    result = result.replace(pattern, (_match, prefix) => prefix ? `${prefix}[redacted]` : "[redacted]");
+  }
+  return result.length > limit ? `${result.slice(0, limit)}\u2026[truncated]` : result;
+}
+function sentryEndpoint(dsn) {
+  try {
+    const parsed = new URL(dsn);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const projectId = parts.at(-1);
+    if (!parsed.username || !projectId) return null;
+    const prefix = parts.slice(0, -1).join("/");
+    return `${parsed.protocol}//${parsed.host}${prefix ? `/${prefix}` : ""}/api/${projectId}/envelope/?sentry_version=7&sentry_key=${encodeURIComponent(parsed.username)}`;
+  } catch {
+    return null;
+  }
+}
+function sanitizeError(error) {
+  const source = error instanceof Error ? error : new Error(String(error));
+  return {
+    type: redactString(source.name || "Error", 120),
+    // Error messages frequently include upstream bodies, prompts, or the
+    // serialized JSON-RPC request. Keep the class for grouping and send the
+    // operation/mechanism tags below, but never export arbitrary message text.
+    value: "Unexpected plugin failure (message withheld).",
+    // Error stacks can embed a rejected request body or prompt through a
+    // dependency's error formatting. The mechanism/operation tags identify
+    // the runtime locus without exporting that unbounded, user-controlled text.
+    stacktrace: void 0
+  };
+}
+function sanitizeContext(context = {}) {
+  const safe = {};
+  for (const [key, value] of Object.entries(context)) {
+    if (!SAFE_CONTEXT_FIELDS.has(key) || value == null) continue;
+    if (typeof value === "number" || typeof value === "boolean") safe[key] = value;
+    else safe[key] = redactString(value, 512);
+  }
+  return safe;
+}
+function isExpectedPluginError(error) {
+  const message = String(error instanceof Error ? error.message : error ?? "");
+  return error?.name === "AbortError" || /^(?:--(?:host|real-bin|workflow|sandbox|approval-policy|approvals-reviewer|delivery-run-id)|Unknown option:)/.test(message) || /^(?:Choose either|Unsupported managed client host|Statewright cannot translate OpenAI model|Provide the task)/.test(message) || message.startsWith("[statewright] BLOCKED:") || message.includes("requires isolated delivery") || message.includes("Native-tool adapter unavailable");
+}
+function createErrorReporter({
+  plugin,
+  version = process.env.npm_package_version ?? "unknown",
+  environment = process.env,
+  send = defaultSend
+} = {}) {
+  const dsn = environment.STATEWRIGHT_SENTRY_DSN ?? DEFAULT_SENTRY_DSN;
+  const endpoint = sentryEndpoint(dsn);
+  const enabled = environment.STATEWRIGHT_SENTRY_DISABLED !== "true" && Boolean(endpoint);
+  const seen = /* @__PURE__ */ new Set();
+  const tags = {
+    plugin: redactString(plugin ?? "unknown", 120),
+    release: `statewright-${redactString(plugin ?? "unknown", 120)}@${redactString(version, 120)}`,
+    platform: `${process.platform}-${process.arch}`,
+    runtime: "node"
+  };
+  async function report(error, context = {}) {
+    const safeContext = sanitizeContext(context);
+    const safeError = sanitizeError(error);
+    const fingerprint = `${safeError.type}:${safeError.value}:${safeContext.mechanism ?? ""}:${safeContext.operation ?? ""}`;
+    if (!enabled || seen.has(fingerprint)) return false;
+    const eventId = randomUUID().replace(/-/g, "");
+    const event = {
+      event_id: eventId,
+      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+      platform: "node",
+      level: "error",
+      release: tags.release,
+      environment: redactString(environment.NODE_ENV || "production", 120),
+      tags: { ...tags, ...safeContext },
+      exception: { values: [safeError] }
+    };
+    try {
+      await send({ endpoint, dsn, event, environment });
+      seen.add(fingerprint);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  function installProcessHandlers() {
+    process.on("unhandledRejection", (reason) => {
+      void report(reason, { mechanism: "unhandled_rejection" });
+    });
+    process.on("uncaughtExceptionMonitor", (error) => {
+      void report(error, { mechanism: "uncaught_exception" });
+    });
+  }
+  return { report, installProcessHandlers, tags };
+}
+function formatEnvelope({ dsn, event }) {
+  return `${JSON.stringify({ event_id: event.event_id, sent_at: event.timestamp, dsn, sdk: { name: "statewright.plugin", version: "1" } })}
+${JSON.stringify({ type: "event", content_type: "application/json" })}
+${JSON.stringify(event)}
+`;
+}
+async function defaultSend({ endpoint, dsn, event, environment }) {
+  if (!endpoint) return;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-sentry-envelope" },
+    body: formatEnvelope({ dsn, event }),
+    signal: AbortSignal.timeout(Number(environment.STATEWRIGHT_SENTRY_TIMEOUT_MS ?? 1e3))
+  });
+  if (!response.ok) throw new Error(`Sentry envelope rejected with HTTP ${response.status}.`);
+}
+
+// src/hook.ts
+var errorReporter = createErrorReporter({ plugin: "omx", version: "0.3.0" });
+errorReporter.installProcessHandlers();
 var SYSTEM_TOOLS = /* @__PURE__ */ new Set([
   "TodoRead",
   "TodoWrite",
@@ -917,7 +1058,8 @@ async function main() {
 }
 var isMainModule = typeof process !== "undefined" && process.argv[1] && (process.argv[1].endsWith("/hook.js") || process.argv[1].endsWith("/hook.ts"));
 if (isMainModule) {
-  main().catch((err) => {
+  main().catch(async (err) => {
+    if (!isExpectedPluginError(err)) await errorReporter.report(err, { mechanism: "entrypoint", operation: "hook", host: "omx" });
     console.error("[statewright] hook error:", err);
     process.exit(0);
   });

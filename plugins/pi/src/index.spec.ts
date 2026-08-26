@@ -7,15 +7,6 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from "vitest"
-import * as Sentry from "@sentry/node"
-
-// Mock @sentry/node before anything imports it
-vi.mock("@sentry/node", () => ({
-  init: vi.fn(),
-  setTag: vi.fn(),
-  setUser: vi.fn(),
-}))
-
 // Mock node:fs
 vi.mock("node:fs", () => ({
   readFileSync: vi.fn(),
@@ -239,22 +230,6 @@ function setupFetch(responses: Array<{ match: string; body: unknown; headers?: R
 }
 
 // --- Tests ---
-
-describe("Sentry initialization", () => {
-  it("calls Sentry.init with the plugins DSN on module load", () => {
-    expect(Sentry.init).toHaveBeenCalledWith(
-      expect.objectContaining({
-        dsn: expect.stringContaining("glitch.enhasa.cloud/12"),
-        release: expect.stringMatching(/^statewright-pi@\d+\.\d+\.\d+$/),
-      })
-    )
-  })
-
-  it("sets plugin and platform tags", () => {
-    expect(Sentry.setTag).toHaveBeenCalledWith("plugin", "pi")
-    expect(Sentry.setTag).toHaveBeenCalledWith("platform", expect.stringMatching(/.+-.+/))
-  })
-})
 
 describe("isolated delivery capability", () => {
   it("detects any required delivery policy", () => {

@@ -16,6 +16,10 @@ import {
 import { join } from "node:path"
 import { homedir } from "node:os"
 import { minimatch } from "minimatch"
+import { createErrorReporter, isExpectedPluginError } from "./error-reporting.mjs"
+
+const errorReporter = createErrorReporter({ plugin: "omx", version: "0.3.0" })
+errorReporter.installProcessHandlers()
 
 // --- Types ---
 
@@ -1293,7 +1297,8 @@ const isMainModule =
     process.argv[1].endsWith("/hook.ts"))
 
 if (isMainModule) {
-  main().catch((err) => {
+  main().catch(async (err) => {
+    if (!isExpectedPluginError(err)) await errorReporter.report(err, { mechanism: "entrypoint", operation: "hook", host: "omx" })
     console.error("[statewright] hook error:", err)
     process.exit(0) // Don't block agent on hook errors
   })

@@ -30,6 +30,7 @@ import {
   SUPPORTED_HOSTS,
 } from "./lib/host-adapters.mjs";
 import { RemoteStatewrightClient, resolveApiKey } from "./lib/remote-client.mjs";
+import { createErrorReporter, isExpectedPluginError } from "./lib/error-reporting.mjs";
 
 const EXECUTOR_ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -536,7 +537,10 @@ function isMainModule() {
 }
 
 if (isMainModule()) {
-  main().catch((error) => {
+  const reporter = createErrorReporter({ plugin: "executor", version: "0.3.0" });
+  reporter.installProcessHandlers();
+  main().catch(async (error) => {
+    if (!isExpectedPluginError(error)) await reporter.report(error, { mechanism: "entrypoint", operation: "statewright_exec" });
     process.stderr.write(`[statewright] ${error.stack ?? error.message}\n`);
     process.exitCode = 1;
   });

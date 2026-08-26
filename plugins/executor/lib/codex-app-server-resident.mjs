@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startCodexAppServerRuntime } from "./codex-app-server-transport.mjs";
+import { createErrorReporter, isExpectedPluginError } from "./error-reporting.mjs";
 import { writeManagedControlIdentity } from "./managed-client-identity.mjs";
 import { ManagedMcpBridge } from "./managed-mcp-bridge.mjs";
 import { resolveApiKey } from "./remote-client.mjs";
@@ -16,6 +17,7 @@ const RESIDENT_RUNTIME_FILES = [
   RESIDENT_ENTRYPOINT,
   join(EXECUTOR_ROOT, "codex-app-server-transport.mjs"),
   join(EXECUTOR_ROOT, "codex-app-server-route-proxy.mjs"),
+  join(EXECUTOR_ROOT, "error-reporting.mjs"),
 ];
 
 function safeName(value) {
@@ -139,6 +141,8 @@ async function main() {
   const command = values.command;
   const cwd = values.cwd;
   const home = values.home ?? homedir();
+  const reporter = createErrorReporter({ plugin: "codex", version: "0.3.0" });
+  reporter.installProcessHandlers();
   if (!clientId || !command || !cwd) throw new Error("resident requires client-id, command, and cwd");
   const root = process.env.STATEWRIGHT_CODEX_RESIDENT_ROOT ?? residentRoot(home, clientId);
   const controlDir = residentControlDir(home, clientId);
@@ -161,6 +165,7 @@ async function main() {
     },
     nextRouteRequest: () => nextRouteRequest(controlDir, clientId),
     telemetry: telemetryWriter(process.env),
+    reporter,
   });
   await writeManifest(manifestPath, {
     version: 2,
@@ -181,5 +186,10 @@ async function main() {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === RESIDENT_ENTRYPOINT) {
-  main().catch((error) => { process.stderr.write(`[statewright] resident App Server failed: ${error.message}\n`); process.exitCode = 2; });
+  main().catch(async (error) => {
+    const reporter = createErrorReporter({ plugin: "codex", version: "0.3.0" });
+    if (!isExpectedPluginError(error)) await reporter.report(error, { mechanism: "entrypoint", operation: "resident_app_server" });
+    process.stderr.write(`[statewright] resident App Server failed: ${error.message}\n`);
+    process.exitCode = 2;
+  });
 }
