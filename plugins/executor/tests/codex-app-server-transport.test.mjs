@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import {
   appServerHomePrefixForClient,
   codexAppServerTransportEnabled,
   routeConfigEdits,
 } from "../lib/codex-app-server-transport.mjs";
-import { residentControlDir, residentMatchesRuntime, residentRoot, residentRuntimeRevision } from "../lib/codex-app-server-resident.mjs";
+import { nextCodexResidentRouteRequest, residentControlDir, residentMatchesRuntime, residentRoot, residentRuntimeRevision } from "../lib/codex-app-server-resident.mjs";
 import { applyCompactResumeRequest, applyRouteToTurnStart, hydrateBoundedResumeTurns, settingsConfirmRoute, startCodexAppServerRouteProxy } from "../lib/codex-app-server-route-proxy.mjs";
 
 function once(socket, event) {
@@ -39,6 +42,19 @@ test("resident App Server state is stable per managed client and keeps routes ou
   assert.equal(residentControlDir(home, "swc_abc:unsafe/path"), `${root}/routes`);
 });
 
+test("resident App Server accepts routes only for the attached root session", async () => {
+  const control = await mkdtemp(join(tmpdir(), "statewright-resident-routes-"));
+  const clientId = "swc_0123456789abcdef0123456789abcdef";
+  try {
+    await writeFile(join(control, "codex-root-session.json"), JSON.stringify({ version: 1, session_id: "root-thread", client_id: clientId }));
+    await writeFile(join(control, "01-root.route.json"), JSON.stringify({ session_id: "root-thread", root_session_id: "root-thread", client_id: clientId, model: "gpt-5.6-terra" }));
+    assert.equal(await nextCodexResidentRouteRequest(control, clientId, "child-thread"), null);
+    assert.deepEqual(await nextCodexResidentRouteRequest(control, clientId, "root-thread"), {
+      session_id: "root-thread", root_session_id: "root-thread", client_id: clientId, model: "gpt-5.6-terra",
+    });
+  } finally { await rm(control, { recursive: true, force: true }); }
+});
+
 test("resident runtime revision changes reuse only when the loaded transport bundle matches", async () => {
   const revision = await residentRuntimeRevision();
   assert.match(revision, /^[a-f0-9]{16}$/);
@@ -66,7 +82,7 @@ test("App Server routing overrides the native next turn and requires a settings 
     id: 12,
     method: "turn/start",
     params: { threadId: "thread-1", input: [] },
-  }, { model: "openai-codex/gpt-5.6-sol", effort: "high" });
+  }, { session_id: "thread-1", model: "openai-codex/gpt-5.6-sol", effort: "high" });
   assert.equal(message.params.model, "gpt-5.6-sol");
   assert.equal(message.params.effort, "high");
   assert.deepEqual(settingsConfirmRoute(receipt, {
@@ -82,6 +98,11 @@ test("App Server routing overrides the native next turn and requires a settings 
     method: "thread/settings/updated",
     params: { threadId: "thread-1", threadSettings: { model: "gpt-5.6-terra", effort: "high" } },
   }).confirmed, false);
+  assert.deepEqual(applyRouteToTurnStart({
+    method: "turn/start", params: { threadId: "different-thread" },
+  }, { session_id: "thread-1", model: "gpt-5.6-sol" }), {
+    message: { method: "turn/start", params: { threadId: "different-thread" } }, receipt: null,
+  });
 });
 
 test("compact resume requests server-supported metadata and bounded recent history", () => {
@@ -115,10 +136,11 @@ test("App Server route proxy injects one pending route and records the server re
   const upstreamAddress = upstream.address();
   const injected = [];
   const confirmed = [];
-  let pending = { model: "openai-codex/gpt-5.6-sol", effort: "high" };
+  let pending = { session_id: "thread-proxy", model: "openai-codex/gpt-5.6-sol", effort: "high" };
   const proxy = await startCodexAppServerRouteProxy({
     upstreamUrl: `ws://127.0.0.1:${upstreamAddress.port}`,
-    takePendingRoute: async () => {
+    takePendingRoute: async (threadId) => {
+      if (pending?.session_id !== threadId) return null;
       const route = pending;
       pending = null;
       return route;
@@ -136,6 +158,11 @@ test("App Server route proxy injects one pending route and records the server re
   await upstreamConnection;
   assert.equal((await fetch(`${proxy.url.replace("ws:", "http:")}/readyz`)).status, 200);
   assert.equal((await fetch(`${proxy.url.replace("ws:", "http:")}/healthz`)).status, 200);
+  const childForwarded = new Promise((resolveMessage) => upstreamSocket.once("message", (raw) => resolveMessage(JSON.parse(String(raw)))));
+  client.send(JSON.stringify({ id: 0, method: "turn/start", params: { threadId: "child-thread", input: [] } }));
+  const childRequest = await childForwarded;
+  assert.equal(childRequest.params.model, undefined);
+  assert.equal(injected.length, 0);
   const forwarded = new Promise((resolveMessage) => upstreamSocket.once("message", (raw) => resolveMessage(JSON.parse(String(raw)))));
   client.send(JSON.stringify({ id: 1, method: "turn/start", params: { threadId: "thread-proxy", input: [] } }));
   const request = await forwarded;

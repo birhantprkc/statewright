@@ -125,7 +125,8 @@ export async function runCodexAppServerTransport({
     cwd,
     home,
     clientId,
-    nextRouteRequest: async () => {
+    nextRouteRequest: async (threadId) => {
+      if (pendingRoute?.session_id && pendingRoute.session_id !== threadId) return null;
       const route = pendingRoute;
       pendingRoute = null;
       return route;

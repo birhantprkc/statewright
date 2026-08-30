@@ -62,10 +62,15 @@ function signalChild(child, signal) {
 
 async function nextRequest(controlDir, consumed) {
   const entries = await (await import("node:fs/promises")).readdir(controlDir);
-  for (const entry of entries.filter((name) => name.endsWith(".json")).sort()) {
+  for (const entry of entries.filter((name) => name === "route.json" || name.endsWith(".route.json")).sort()) {
     if (consumed.has(entry)) continue;
     const request = JSON.parse(await readFile(join(controlDir, entry), "utf8"));
     consumed.add(entry);
+    const registration = await readFile(join(controlDir, "codex-root-session.json"), "utf8").then(JSON.parse).catch(() => null);
+    if (!registration || registration.version !== 1) continue;
+    if (request.client_id !== registration.client_id) continue;
+    if (request.session_id !== registration.session_id || request.root_session_id !== registration.session_id) continue;
+    if (typeof request.model !== "string") continue;
     return request;
   }
   return null;
@@ -82,7 +87,7 @@ export async function run(options) {
       const child = spawn(options.codexBin, codexArgs({ ...route, resumeSession, prompt }), {
         stdio: "inherit",
         detached: process.platform !== "win32",
-        env: { ...process.env, STATEWRIGHT_ROUTE_CONTROL_DIR: controlDir },
+        env: { ...(options.environment ?? process.env), STATEWRIGHT_ROUTE_CONTROL_DIR: controlDir },
       });
       let restartRequested = false;
       let exited = false;

@@ -41,6 +41,8 @@ test("workflow load emits an atomic route restart request only for a supervised 
   const home = await mkdtemp(resolve(tmpdir(), "statewright-tui-hook-"));
   const controlDir = await mkdtemp(resolve(tmpdir(), "statewright-tui-route-"));
   try {
+    const registration = await invokeHook({ session_id: "session-1", prompt: "start" }, { HOME: home, STATEWRIGHT_ROUTE_CONTROL_DIR: controlDir }, "user-prompt");
+    assert.equal(registration.status, 0, registration.stderr);
     const result = await invokeHook({
       session_id: "session-1",
       tool_name: "mcp__statewright__statewright_load_workflow",
@@ -55,11 +57,12 @@ test("workflow load emits an atomic route restart request only for a supervised 
       } }),
     }, { HOME: home, STATEWRIGHT_ROUTE_CONTROL_DIR: controlDir });
     assert.equal(result.status, 0, result.stderr);
-    const entries = await readdir(controlDir);
+    const entries = (await readdir(controlDir)).filter((entry) => entry.endsWith(".route.json"));
     assert.equal(entries.length, 1);
     const route = JSON.parse(await readFile(resolve(controlDir, entries[0]), "utf8"));
     assert.deepEqual(route, {
       session_id: "session-1",
+      root_session_id: "session-1",
       client_id: route.client_id,
       run_id: "run-1",
       state: "baseline",
@@ -67,6 +70,51 @@ test("workflow load emits an atomic route restart request only for a supervised 
       effort: "high",
     });
     assert.match(route.client_id, /^swc_[0-9a-f]{32}$/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+    await rm(controlDir, { recursive: true, force: true });
+  }
+});
+
+test("workflow load beneath codex exec does not request a parent TUI restart", async () => {
+  const home = await mkdtemp(resolve(tmpdir(), "statewright-tui-hook-"));
+  const controlDir = await mkdtemp(resolve(tmpdir(), "statewright-tui-route-"));
+  const fakeCodex = resolve(home, "codex");
+  try {
+    await writeFile(resolve(controlDir, "codex-root-session.json"), JSON.stringify({
+      version: 1,
+      session_id: "ephemeral-review-thread",
+      client_id: "swc_0123456789abcdef0123456789abcdef",
+    }));
+    await writeFile(resolve(controlDir, "identity.json"), JSON.stringify({
+      version: 1,
+      host: "codex",
+      client_id: "swc_0123456789abcdef0123456789abcdef",
+    }));
+    await writeFile(fakeCodex, `#!/usr/bin/env bash\nbash ${JSON.stringify(resolve(codexRoot, "hook.sh"))} post-tool\n`);
+    await chmod(fakeCodex, 0o755);
+    const result = await new Promise((resolveResult) => {
+      const child = spawn(fakeCodex, ["exec", "--ephemeral", "review this diff"], {
+        env: { ...process.env, HOME: home, STATEWRIGHT_ROUTE_CONTROL_DIR: controlDir },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+      child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+      child.once("exit", (status) => resolveResult({ status, stdout, stderr }));
+      child.stdin.end(`${JSON.stringify({
+        session_id: "ephemeral-review-thread",
+        tool_name: "mcp__statewright__statewright_load_workflow",
+        tool_response: JSON.stringify({ state_snapshot: {
+          workflow: "routing-test", state: "review", run_id: "run-review",
+          model: "openai-codex/gpt-5.6-sol", thinking_level: "high",
+          allowed_tools: ["Read"], transitions: [],
+        } }),
+      })}\n`);
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual((await readdir(controlDir)).filter((entry) => entry.endsWith(".route.json")), []);
   } finally {
     await rm(home, { recursive: true, force: true });
     await rm(controlDir, { recursive: true, force: true });
@@ -117,15 +165,20 @@ test("interactive supervisor restarts the child with the next state route", asyn
   const root = await mkdtemp(resolve(tmpdir(), "statewright-tui-supervisor-"));
   const fakeCodex = resolve(root, "fake-codex.mjs");
   const calls = resolve(root, "calls.log");
+  const home = resolve(root, "home");
   try {
     await writeFile(fakeCodex, `#!/usr/bin/env node
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 appendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + "\\n");
 const marker = join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "emitted");
 if (!existsSync(marker)) {
   writeFileSync(marker, "");
-  writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "route.json"), JSON.stringify({ session_id: "session-1", model: "openai-codex/gpt-5.6-sol", effort: "high" }));
+  spawnSync("bash", [${JSON.stringify(resolve(codexRoot, "hook.sh"))}, "user-prompt"], { env: process.env, input: JSON.stringify({ session_id: "session-1", prompt: "start" }) });
+  const registration = JSON.parse(readFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "codex-root-session.json"), "utf8"));
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
+  writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "route.json"), JSON.stringify({ session_id: "session-1", root_session_id: "session-1", client_id: registration.client_id, model: "openai-codex/gpt-5.6-sol", effort: "high" }));
   process.on("SIGINT", () => process.exit(0));
   process.on("SIGTERM", () => process.exit(0));
   setInterval(() => {}, 1000);
@@ -138,6 +191,7 @@ if (!existsSync(marker)) {
       codexBin: fakeCodex,
       fallbackModel: "gpt-5.6-terra",
       fallbackEffort: "low",
+      environment: { ...process.env, HOME: home },
     }), 0);
     const invocations = (await readFile(calls, "utf8")).trim().split("\n");
     assert.equal(invocations.length, 2);
@@ -152,6 +206,8 @@ test("workflow load requests a hard boundary for a state that inherits its route
   const home = await mkdtemp(resolve(tmpdir(), "statewright-tui-hook-"));
   const controlDir = await mkdtemp(resolve(tmpdir(), "statewright-tui-route-"));
   try {
+    const registration = await invokeHook({ session_id: "session-2", prompt: "start" }, { HOME: home, STATEWRIGHT_ROUTE_CONTROL_DIR: controlDir }, "user-prompt");
+    assert.equal(registration.status, 0, registration.stderr);
     const result = await invokeHook({
       session_id: "session-2",
       tool_name: "mcp__statewright__statewright_load_workflow",
@@ -164,7 +220,7 @@ test("workflow load requests a hard boundary for a state that inherits its route
       } }),
     }, { HOME: home, STATEWRIGHT_ROUTE_CONTROL_DIR: controlDir });
     assert.equal(result.status, 0, result.stderr);
-    const entries = await readdir(controlDir);
+    const entries = (await readdir(controlDir)).filter((entry) => entry.endsWith(".route.json"));
     assert.equal(entries.length, 1);
     const request = JSON.parse(await readFile(resolve(controlDir, entries[0]), "utf8"));
     assert.equal(request.model, "");

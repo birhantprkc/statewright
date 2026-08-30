@@ -58,6 +58,9 @@ source "${SCRIPT_DIR}/client-id.sh"
 # turn-local hook invocation, so use it only for older hosts that omit a thread.
 HOOK_SESSION=$(echo "$HOOK_INPUT" | jq -r '.thread_id // .session_id // empty' 2>/dev/null || true)
 CLIENT_ID=$(statewright_client_id codex "$HOOK_SESSION")
+if [ "$ENDPOINT" = "user-prompt" ]; then
+  statewright_register_codex_root_session "$HOOK_SESSION" "$CLIENT_ID"
+fi
 SESSION_KEY="${CLIENT_ID#swc_}"
 SESSION_KEY="${SESSION_KEY:0:16}"
 PROJECT_DIR="$STATEWRIGHT_DIR/sessions/$SESSION_KEY"
@@ -282,21 +285,33 @@ emit_native_telemetry() {
 # never kills Codex itself; it only persists the authoritative next route.
 request_interactive_route_restart() {
   local state_json="$1"
-  local control_dir model effort request_path
+  local control_dir model effort request_path root_session_id registration
   control_dir="${STATEWRIGHT_ROUTE_CONTROL_DIR:-}"
   [ -n "$control_dir" ] || return 0
+  # One-shot Codex children may inherit a managed parent's route directory when
+  # a login shell resolves the real binary ahead of the Statewright shim. They
+  # may report telemetry, but must never ask the parent TUI supervisor to adopt
+  # their ephemeral thread as its restart target.
+  statewright_codex_one_shot_ancestor && return 0
+  registration="$control_dir/codex-root-session.json"
+  [ -r "$registration" ] || return 0
+  root_session_id=$(jq -r --arg client_id "$CLIENT_ID" \
+    'if .version == 1 and .client_id == $client_id and (.session_id | type) == "string" then .session_id else empty end' \
+    "$registration" 2>/dev/null || true)
+  [ -n "$root_session_id" ] && [ "$HOOK_SESSION" = "$root_session_id" ] || return 0
   model=$(echo "$state_json" | jq -r '.model // empty' 2>/dev/null || true)
   effort=$(echo "$state_json" | jq -r '.thinking_level // empty' 2>/dev/null || true)
   mkdir -p "$control_dir" || return 0
   request_path="$control_dir/$(date +%s%N)-${HOOK_SESSION:-unknown}.route.json"
   jq -n \
     --arg session_id "$HOOK_SESSION" \
+    --arg root_session_id "$root_session_id" \
     --arg client_id "$CLIENT_ID" \
     --arg run_id "$(echo "$state_json" | jq -r '.run_id // empty' 2>/dev/null || true)" \
     --arg state "$(echo "$state_json" | jq -r '.state // empty' 2>/dev/null || true)" \
     --arg model "$model" \
     --arg effort "$effort" \
-    '{session_id: $session_id, client_id: $client_id, run_id: $run_id, state: $state, model: $model, effort: $effort}' \
+    '{session_id: $session_id, root_session_id: $root_session_id, client_id: $client_id, run_id: $run_id, state: $state, model: $model, effort: $effort}' \
     > "$request_path.tmp" && mv "$request_path.tmp" "$request_path"
 }
 

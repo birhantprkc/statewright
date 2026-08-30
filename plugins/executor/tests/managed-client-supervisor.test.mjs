@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { bindManagedClientIdentity, resolveManagedClientIdentity } from "../lib/managed-client-identity.mjs";
+import { bindManagedClientIdentity, resolveManagedClientIdentity, resumedSessionId } from "../lib/managed-client-identity.mjs";
 import { bootstrapManagedClients, buildRoutedArgs, codexOneShotInvocation, managedClientChildEnvironment, managedClientEnabled, resolveRealBinary, routeClaudeModel, runManagedClient, setManagedClientEnabled, uninstallManagedClients } from "../lib/managed-client-supervisor.mjs";
 
 function fakeBridgeFactory() {
@@ -41,6 +41,18 @@ test("managed identity persists a fresh session for a later Codex resume", async
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
+test("Codex resume selectors are not mistaken for durable session IDs", () => {
+  assert.equal(resumedSessionId("codex", ["resume", "--last"]), null);
+  assert.equal(resumedSessionId("codex", ["resume", "--all"]), null);
+  assert.equal(resumedSessionId("codex", ["resume", "--include-non-interactive", "--last"]), null);
+  assert.equal(resumedSessionId("codex", ["resume", "--all", "durable-thread"]), "durable-thread");
+  assert.equal(resumedSessionId("codex", ["resume", "-m", "gpt-5.6-sol", "durable-thread"]), "durable-thread");
+  assert.equal(resumedSessionId("codex", ["-C", "resume", "fix-it"]), null);
+  assert.equal(resumedSessionId("codex", ["--profile", "resume", "fix-it"]), null);
+  assert.equal(resumedSessionId("codex", ["-m", "resume", "fix-it"]), null);
+  assert.equal(resumedSessionId("codex", ["-m", "gpt-5.6-sol", "resume", "durable-thread"]), "durable-thread");
+});
+
 test("nested Codex launches discard parent thread and managed-control identities", () => {
   const child = managedClientChildEnvironment({
     host: "codex",
@@ -57,6 +69,7 @@ test("nested Codex launches discard parent thread and managed-control identities
       STATEWRIGHT_MANAGED_MCP_URL: "http://127.0.0.1:1000",
       STATEWRIGHT_MANAGED_MCP_SESSION_ID: "parent-managed-session",
       STATEWRIGHT_MANAGED_MCP_TOKEN: "parent-bridge-token",
+      STATEWRIGHT_MANAGED_CODEX_ROOT_SESSION_ID: "parent-root",
       STATEWRIGHT_MANAGED_TELEMETRY_OWNER: "supervisor",
     },
     overrides: {
@@ -71,6 +84,7 @@ test("nested Codex launches discard parent thread and managed-control identities
   assert.equal(child.STATEWRIGHT_MANAGED_MCP_SESSION_ID, undefined);
   assert.equal(child.STATEWRIGHT_MANAGED_MCP_TOKEN, undefined);
   assert.equal(child.STATEWRIGHT_MANAGED_TELEMETRY_OWNER, undefined);
+  assert.equal(child.STATEWRIGHT_MANAGED_CODEX_ROOT_SESSION_ID, undefined);
   assert.equal(child.STATEWRIGHT_CLIENT_ID, "swc_child");
   assert.equal(child.STATEWRIGHT_ROUTE_CONTROL_DIR, "/tmp/child-control");
   assert.equal(child.STATEWRIGHT_API_KEY, "keep-auth-config");
@@ -293,7 +307,7 @@ test("managed supervisor only restarts its own child after a route request", asy
   const fake = join(root, "fake-codex.mjs");
   const calls = join(root, "calls.log");
   try {
-    await writeFile(fake, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, writeFileSync } from "node:fs";\nimport { join } from "node:path";\nappendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + " " + process.env.STATEWRIGHT_MANAGED_MCP_URL + "\\n");\nconst marker = join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "once");\nif (!existsSync(marker)) { writeFileSync(marker, ""); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "route.json"), JSON.stringify({session_id:"session-3",client_id:process.env.STATEWRIGHT_CLIENT_ID,model:"openai-codex/gpt-5.6-sol",effort:"high"})); process.on("SIGINT", () => process.exit(0)); setInterval(() => {}, 1000); }\n`);
+    await writeFile(fake, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, writeFileSync } from "node:fs";\nimport { join } from "node:path";\nappendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + " " + process.env.STATEWRIGHT_MANAGED_MCP_URL + "\\n");\nconst marker = join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "once");\nif (!existsSync(marker)) { writeFileSync(marker, ""); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "codex-root-session.json"), JSON.stringify({version:1,session_id:"session-3",client_id:process.env.STATEWRIGHT_CLIENT_ID})); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "route.json"), JSON.stringify({session_id:"session-3",root_session_id:"session-3",client_id:process.env.STATEWRIGHT_CLIENT_ID,model:"openai-codex/gpt-5.6-sol",effort:"high"})); process.on("SIGINT", () => process.exit(0)); setInterval(() => {}, 1000); }\n`);
     await chmod(fake, 0o755);
     assert.equal(await runManagedClient({ host: "codex", command: fake, args: ["--full-auto"], environment: { PATH: process.env.PATH, STATEWRIGHT_API_KEY: "test" }, home: root, pollMs: 5, bridgeFactory: fakeBridgeFactory }), 0);
     const callsText = await readFile(calls, "utf8");
@@ -303,12 +317,78 @@ test("managed supervisor only restarts its own child after a route request", asy
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("a fresh managed Codex does not let the first child route elect itself as root", async () => {
+  const root = await mkdtemp(join(tmpdir(), "statewright-managed-codex-fresh-child-"));
+  const fake = join(root, "fake-codex.mjs");
+  const calls = join(root, "calls.log");
+  try {
+    await writeFile(fake, `#!/usr/bin/env node\nimport { appendFileSync, writeFileSync } from "node:fs";\nimport { join } from "node:path";\nappendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + "\\n");\nwriteFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "child.route.json"), JSON.stringify({session_id:"child-first",root_session_id:"child-first",client_id:process.env.STATEWRIGHT_CLIENT_ID,model:"openai-codex/gpt-5.6-sol",effort:"high"}));\nsetTimeout(() => process.exit(0), 100);\n`);
+    await chmod(fake, 0o755);
+    assert.equal(await runManagedClient({ host: "codex", command: fake, args: [], environment: { PATH: process.env.PATH, STATEWRIGHT_API_KEY: "test" }, home: root, pollMs: 5, bridgeFactory: fakeBridgeFactory }), 0);
+    assert.deepEqual((await readFile(calls, "utf8")).trim().split("\n"), [""]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("managed Codex discovers the actual root thread behind resume --last", async () => {
+  const root = await mkdtemp(join(tmpdir(), "statewright-managed-codex-resume-last-"));
+  const fake = join(root, "fake-codex.mjs");
+  const calls = join(root, "calls.log");
+  try {
+    await writeFile(fake, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, writeFileSync } from "node:fs";\nimport { join } from "node:path";\nappendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + "\\n");\nconst marker = join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "once");\nif (!existsSync(marker)) { writeFileSync(marker, ""); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "codex-root-session.json"), JSON.stringify({version:1,session_id:"actual-last-thread",client_id:process.env.STATEWRIGHT_CLIENT_ID})); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "route.json"), JSON.stringify({session_id:"actual-last-thread",root_session_id:"actual-last-thread",client_id:process.env.STATEWRIGHT_CLIENT_ID,model:"openai-codex/gpt-5.6-sol",effort:"high"})); process.on("SIGINT", () => process.exit(0)); setInterval(() => {}, 1000); }\n`);
+    await chmod(fake, 0o755);
+    assert.equal(await runManagedClient({ host: "codex", command: fake, args: ["resume", "--last"], environment: { PATH: process.env.PATH, STATEWRIGHT_API_KEY: "test" }, home: root, pollMs: 5, bridgeFactory: fakeBridgeFactory }), 0);
+    const callLines = (await readFile(calls, "utf8")).trim().split("\n");
+    assert.equal(callLines.length, 2);
+    assert.equal(callLines[0], "resume --last");
+    assert.match(callLines[1], /resume actual-last-thread/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("managed Codex ignores an ephemeral child route emitted through a zsh login-shell bypass", async (t) => {
+  if (process.platform === "win32") return t.skip("zsh regression is POSIX-only");
+  const root = await mkdtemp(join(tmpdir(), "statewright-managed-codex-zsh-"));
+  const parent = join(root, "parent-codex.mjs");
+  const directBin = join(root, "direct-bin");
+  const shimBin = join(root, "shim-bin");
+  const zdotdir = join(root, "zdotdir");
+  const calls = join(root, "calls.log");
+  const selected = join(root, "direct-selected");
+  try {
+    await mkdir(directBin, { recursive: true });
+    await mkdir(shimBin, { recursive: true });
+    await mkdir(zdotdir, { recursive: true });
+    await writeFile(join(zdotdir, ".zprofile"), `export PATH=${JSON.stringify(directBin)}:$PATH\n`);
+    await writeFile(join(shimBin, "codex"), `#!/usr/bin/env bash\nexit 97\n`);
+    await writeFile(join(directBin, "codex"), `#!/usr/bin/env bash\nprintf selected > ${JSON.stringify(selected)}\nprintf '{"session_id":"ephemeral-child","client_id":"%s","model":"openai-codex/gpt-5.6-sol","effort":"high"}' "$STATEWRIGHT_CLIENT_ID" > "$STATEWRIGHT_ROUTE_CONTROL_DIR/child.route.json"\n`);
+    await writeFile(parent, `#!/usr/bin/env node\nimport { appendFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nappendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + "\\n");\nspawnSync("/bin/zsh", ["-lc", "codex exec --ephemeral review-this-diff"], { env: process.env, stdio: "inherit" });\nsetTimeout(() => process.exit(0), 100);\n`);
+    await chmod(join(shimBin, "codex"), 0o755);
+    await chmod(join(directBin, "codex"), 0o755);
+    await chmod(parent, 0o755);
+    assert.equal(await runManagedClient({
+      host: "codex",
+      command: parent,
+      args: ["resume", "durable-parent"],
+      environment: {
+        PATH: `${shimBin}:${process.env.PATH}`,
+        ZDOTDIR: zdotdir,
+        STATEWRIGHT_API_KEY: "test",
+      },
+      home: root,
+      pollMs: 5,
+      bridgeFactory: fakeBridgeFactory,
+    }), 0);
+    await access(selected);
+    const callLines = (await readFile(calls, "utf8")).trim().split("\n");
+    assert.deepEqual(callLines, ["resume durable-parent"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("managed supervisor preserves its own identity across a routed restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "statewright-managed-client-identity-"));
   const fake = join(root, "fake-codex.mjs");
   const calls = join(root, "calls.log");
   try {
-    await writeFile(fake, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, writeFileSync } from "node:fs";\nimport { join } from "node:path";\nappendFileSync(${JSON.stringify(calls)}, process.env.STATEWRIGHT_CLIENT_ID + "\\n");\nconst marker = join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "once");\nif (!existsSync(marker)) { writeFileSync(marker, ""); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "route.json"), JSON.stringify({session_id:"session-4",client_id:process.env.STATEWRIGHT_CLIENT_ID,model:"openai-codex/gpt-5.6-sol",effort:"high"})); process.on("SIGINT", () => process.exit(0)); setInterval(() => {}, 1000); }\n`);
+    await writeFile(fake, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, writeFileSync } from "node:fs";\nimport { join } from "node:path";\nappendFileSync(${JSON.stringify(calls)}, process.env.STATEWRIGHT_CLIENT_ID + "\\n");\nconst marker = join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "once");\nif (!existsSync(marker)) { writeFileSync(marker, ""); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "codex-root-session.json"), JSON.stringify({version:1,session_id:"session-4",client_id:process.env.STATEWRIGHT_CLIENT_ID})); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "route.json"), JSON.stringify({session_id:"session-4",root_session_id:"session-4",client_id:process.env.STATEWRIGHT_CLIENT_ID,model:"openai-codex/gpt-5.6-sol",effort:"high"})); process.on("SIGINT", () => process.exit(0)); setInterval(() => {}, 1000); }\n`);
     await chmod(fake, 0o755);
     assert.equal(await runManagedClient({
       host: "codex", command: fake, args: [], environment: { PATH: process.env.PATH, STATEWRIGHT_API_KEY: "test" }, home: root, pollMs: 5, bridgeFactory: fakeBridgeFactory,
@@ -327,7 +407,7 @@ test("managed Codex telemetry survives a routed child restart and stops after it
   const port = 32000 + (process.pid % 10000);
   const telemetryDir = join(root, "telemetry");
   try {
-    await writeFile(fake, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, writeFileSync } from "node:fs";\nimport { join } from "node:path";\nappendFileSync(${JSON.stringify(calls)}, process.argv.join(" ") + "\\n");\nconst marker = join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "once");\nif (!existsSync(marker)) { writeFileSync(marker, ""); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "route.json"), JSON.stringify({session_id:"telemetry-session",client_id:process.env.STATEWRIGHT_CLIENT_ID,model:"openai-codex/gpt-5.6-sol",effort:"high"})); process.on("SIGINT", () => process.exit(0)); setInterval(() => {}, 1000); }\nsetTimeout(() => process.exit(0), 500);\n`);
+    await writeFile(fake, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, writeFileSync } from "node:fs";\nimport { join } from "node:path";\nappendFileSync(${JSON.stringify(calls)}, process.argv.join(" ") + "\\n");\nconst marker = join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "once");\nif (!existsSync(marker)) { writeFileSync(marker, ""); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "codex-root-session.json"), JSON.stringify({version:1,session_id:"telemetry-session",client_id:process.env.STATEWRIGHT_CLIENT_ID})); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "route.json"), JSON.stringify({session_id:"telemetry-session",root_session_id:"telemetry-session",client_id:process.env.STATEWRIGHT_CLIENT_ID,model:"openai-codex/gpt-5.6-sol",effort:"high"})); process.on("SIGINT", () => process.exit(0)); setInterval(() => {}, 1000); }\nsetTimeout(() => process.exit(0), 500);\n`);
     await chmod(fake, 0o755);
     const running = runManagedClient({
       host: "codex",

@@ -1,9 +1,45 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const STORE_FILE = "managed-client-session-ids.json";
+export const CODEX_ROOT_SESSION_FILE = "codex-root-session.json";
+const CODEX_OPTIONS_WITH_VALUE = new Set([
+  "-a", "--ask-for-approval", "-C", "--cd", "-c", "--config",
+  "--disable", "--enable", "--local-provider", "-m", "--model",
+  "-p", "--profile", "--remote", "--remote-auth-token-env",
+  "-s", "--sandbox", "--add-dir",
+]);
+const CODEX_TOP_LEVEL_COMMANDS = new Set([
+  "agents", "app", "app-server", "apply", "archive", "cloud", "completion", "debug", "delete",
+  "doctor", "e", "exec", "exec-server", "features", "fork", "help", "login", "logout", "mcp",
+  "mcp-server", "migrate-rollouts", "plugin", "queue", "remote-control", "resume", "review", "sandbox",
+  "unarchive", "update",
+]);
+
+function codexTopLevelCommandIndex(args) {
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--") return -1;
+    if (argument.startsWith("-") && argument.includes("=")) continue;
+    if (argument === "-i" || argument === "--image") {
+      while (index + 1 < args.length) {
+        const candidate = args[index + 1];
+        if (candidate === "--" || candidate.startsWith("-") || CODEX_TOP_LEVEL_COMMANDS.has(candidate)) break;
+        index += 1;
+      }
+      continue;
+    }
+    if (CODEX_OPTIONS_WITH_VALUE.has(argument)) {
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("-")) continue;
+    return CODEX_TOP_LEVEL_COMMANDS.has(argument) ? index : -1;
+  }
+  return -1;
+}
 
 function opaqueId() {
   return `swc_${randomUUID().replaceAll("-", "")}`;
@@ -23,8 +59,22 @@ function validId(value) {
 
 export function resumedSessionId(host, args) {
   if (host === "codex") {
-    const index = args.indexOf("resume");
-    return index >= 0 ? args[index + 1] ?? null : null;
+    const index = codexTopLevelCommandIndex(args);
+    if (index < 0) return null;
+    if (args[index] !== "resume") return null;
+    for (let argumentIndex = index + 1; argumentIndex < args.length; argumentIndex += 1) {
+      const argument = args[argumentIndex];
+      if (argument === "--last") return null;
+      if (argument === "--") return args[argumentIndex + 1] ?? null;
+      if (argument.startsWith("-") && argument.includes("=")) continue;
+      if (CODEX_OPTIONS_WITH_VALUE.has(argument)) {
+        argumentIndex += 1;
+        continue;
+      }
+      if (argument.startsWith("-")) continue;
+      return argument;
+    }
+    return null;
   }
   if (host === "claude") {
     for (let index = 0; index < args.length; index += 1) {
@@ -32,6 +82,40 @@ export function resumedSessionId(host, args) {
     }
   }
   return null;
+}
+
+export async function readCodexRootSession(controlDir, expectedClientId = null) {
+  try {
+    const registration = JSON.parse(await readFile(join(controlDir, CODEX_ROOT_SESSION_FILE), "utf8"));
+    if (registration?.version !== 1 || typeof registration.session_id !== "string" || !registration.session_id.trim()) return null;
+    if (!validId(registration.client_id)) return null;
+    if (expectedClientId && registration.client_id !== expectedClientId) return null;
+    return { sessionId: registration.session_id.trim(), clientId: registration.client_id };
+  } catch {
+    return null;
+  }
+}
+
+export async function resetCodexRootSession(controlDir, { sessionId = null, clientId } = {}) {
+  const path = join(controlDir, CODEX_ROOT_SESSION_FILE);
+  await unlink(path).catch((error) => {
+    if (error?.code !== "ENOENT") throw error;
+  });
+  if (!sessionId) return null;
+  if (!validId(clientId)) throw new Error("Statewright Codex root registration requires a valid managed client identity.");
+  const registration = { version: 1, session_id: sessionId, client_id: clientId };
+  await writeFile(path, `${JSON.stringify(registration)}\n`, { mode: 0o600, flag: "wx" });
+  await chmod(path, 0o600);
+  return registration;
+}
+
+export function codexRouteOwnsRoot(request, registration) {
+  if (!registration) return false;
+  const requestSessionId = String(request?.session_id ?? "").trim();
+  const declaredRoot = String(request?.root_session_id ?? "").trim();
+  return request?.client_id === registration.clientId
+    && requestSessionId === registration.sessionId
+    && (!declaredRoot || declaredRoot === registration.sessionId);
 }
 
 function storePath(home) {

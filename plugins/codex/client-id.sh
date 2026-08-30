@@ -35,6 +35,109 @@ statewright_codex_resume_material() {
   '
 }
 
+statewright_codex_top_level_command() {
+  case "$1" in
+    agents|app|app-server|apply|archive|cloud|completion|debug|delete|doctor|e|exec|exec-server|features|fork|help|login|logout|mcp|mcp-server|migrate-rollouts|plugin|queue|remote-control|resume|review|sandbox|unarchive|update)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# Classify the actual Codex process command, not arbitrary ancestor text. A
+# direct package-manager install commonly appears as either `codex ...` or
+# `node /path/to/codex ...`; shell-script shims appear as `bash /path/codex`.
+statewright_codex_one_shot_command() {
+  local command_line="$1"
+  local -a fields=()
+  local index=0 codex_index=-1 argument basename candidate
+  read -r -a fields <<< "$command_line"
+
+  while [ "$index" -lt "${#fields[@]}" ] && [ "$index" -lt 2 ]; do
+    basename="${fields[$index]##*/}"
+    case "$basename" in
+      codex|codex.js)
+        codex_index="$index"
+        break
+        ;;
+    esac
+    index=$((index + 1))
+  done
+  [ "$codex_index" -ge 0 ] || return 1
+
+  index=$((codex_index + 1))
+  while [ "$index" -lt "${#fields[@]}" ]; do
+    argument="${fields[$index]}"
+    case "$argument" in
+      --)
+        return 1
+        ;;
+      -i|--image)
+        index=$((index + 1))
+        while [ "$index" -lt "${#fields[@]}" ]; do
+          candidate="${fields[$index]}"
+          if [ "$candidate" = "--" ] || [[ "$candidate" == -* ]] || statewright_codex_top_level_command "$candidate"; then
+            break
+          fi
+          index=$((index + 1))
+        done
+        continue
+        ;;
+      -a|--ask-for-approval|-C|--cd|-c|--config|--disable|--enable|--local-provider|-m|--model|-p|--profile|--remote|--remote-auth-token-env|-s|--sandbox|--add-dir)
+        index=$((index + 2))
+        continue
+        ;;
+      --*=*|-*)
+        index=$((index + 1))
+        continue
+        ;;
+      exec|e|review)
+        return 0
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+  return 1
+}
+
+statewright_codex_one_shot_ancestor() {
+  local pid="${1:-${PPID:-0}}"
+  local depth=0 command_line parent_pid
+  while [ "$pid" -gt 1 ] 2>/dev/null && [ "$depth" -lt 12 ]; do
+    command_line=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    if statewright_codex_one_shot_command "$command_line"; then
+      return 0
+    fi
+    parent_pid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
+    [ -n "$parent_pid" ] || break
+    pid="$parent_pid"
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
+statewright_register_codex_root_session() {
+  local session_id="$1"
+  local client_id="$2"
+  local control_dir="${STATEWRIGHT_ROUTE_CONTROL_DIR:-}"
+  local registration lock_dir temporary
+  [ -n "$control_dir" ] && [ -n "$session_id" ] && [ -n "$client_id" ] || return 0
+  statewright_codex_one_shot_ancestor && return 0
+  registration="$control_dir/codex-root-session.json"
+  [ -e "$registration" ] && return 0
+  lock_dir="$control_dir/.codex-root-session.lock"
+  mkdir "$lock_dir" 2>/dev/null || return 0
+  if [ ! -e "$registration" ]; then
+    temporary="$lock_dir/registration.json"
+    jq -n --arg session_id "$session_id" --arg client_id "$client_id" \
+      '{version: 1, session_id: $session_id, client_id: $client_id}' > "$temporary" && \
+      chmod 600 "$temporary" && mv "$temporary" "$registration"
+  fi
+  rmdir "$lock_dir" 2>/dev/null || true
+}
+
 statewright_host_process_material() {
   local host="$1"
   local pid="${PPID:-0}"

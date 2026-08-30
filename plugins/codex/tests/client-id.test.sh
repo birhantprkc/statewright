@@ -18,6 +18,11 @@ second_hook_id=$(statewright_client_id codex stable-hook-session)
 hook_thread=$(printf '%s' '{"thread_id":"thread-a","session_id":"thread-a-turn-a"}' | jq -r '.thread_id // .session_id // empty')
 [ "$hook_thread" = "thread-a" ]
 [ "$(statewright_codex_resume_material 'node codex resume durable-thread continue')" = "codex-thread:durable-thread" ]
+statewright_codex_one_shot_command 'node /opt/homebrew/bin/codex exec --ephemeral review this diff'
+statewright_codex_one_shot_command '/opt/homebrew/bin/codex -m gpt-5.6-sol review --uncommitted'
+statewright_codex_one_shot_command 'node /opt/homebrew/bin/codex --search e review this diff'
+if statewright_codex_one_shot_command 'node /opt/homebrew/bin/codex resume durable-thread exec'; then exit 1; fi
+if statewright_codex_one_shot_command 'bash -lc echo codex exec'; then exit 1; fi
 
 managed_root=$(mktemp -d)
 export STATEWRIGHT_ROUTE_CONTROL_DIR="$managed_root"

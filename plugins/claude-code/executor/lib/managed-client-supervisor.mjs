@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ManagedMcpBridge } from "./managed-mcp-bridge.mjs";
-import { bindManagedClientIdentity, resolveManagedClientIdentity, writeManagedControlIdentity } from "./managed-client-identity.mjs";
+import { bindManagedClientIdentity, codexRouteOwnsRoot, readCodexRootSession, resetCodexRootSession, resolveManagedClientIdentity, writeManagedControlIdentity } from "./managed-client-identity.mjs";
 import { resolveApiKey } from "./remote-client.mjs";
 import { createErrorReporter, isExpectedExit } from "./error-reporting.mjs";
 
@@ -19,6 +19,7 @@ const PARENT_MANAGED_IDENTITY_ENV = [
   "STATEWRIGHT_ROUTE_CONTROL_DIR",
   "STATEWRIGHT_MANAGED_CLIENT_HOST",
   "STATEWRIGHT_MANAGED_CLAUDE_ROOT_SESSION_ID",
+  "STATEWRIGHT_MANAGED_CODEX_ROOT_SESSION_ID",
   "STATEWRIGHT_MANAGED_MCP_URL",
   "STATEWRIGHT_MANAGED_MCP_SESSION_ID",
   "STATEWRIGHT_MANAGED_MCP_TOKEN",
@@ -462,18 +463,23 @@ export async function runManagedClient({ host, command, args, environment = proc
   const controlDir = await mkdtemp(join(tmpdir(), `statewright-${host}-route-`));
   const consumed = new Set();
   let nextArgs = args;
-  // A managed Claude process can spawn native child agents. Those children
-  // inherit the bridge identity, but they are not safe restart targets: a
-  // process-group signal would tear down the parent/child handoff that Claude
-  // owns. Lock routing to the first session that loaded the workflow.
+  // Managed clients can spawn native children. Those children inherit the
+  // bridge identity, but are not safe restart targets: a process-group signal
+  // would tear down the parent/child handoff. Lock routing to the durable root
+  // session rather than trusting the shared client ID alone.
   let claudeRootSessionId = null;
+  let codexRootSessionId = null;
   let bridge = null;
   let telemetry = null;
   try {
     const identity = await resolveManagedClientIdentity({ host, args, home });
     const routedClientId = identity.clientId;
+    if (host === "codex") codexRootSessionId = identity.sessionId;
     const isolatedEnvironment = managedClientChildEnvironment({ host, environment });
     await writeManagedControlIdentity(controlDir, { host, clientId: routedClientId });
+    if (host === "codex") {
+      await resetCodexRootSession(controlDir, { sessionId: codexRootSessionId, clientId: routedClientId });
+    }
     telemetry = host === "codex"
       ? await acquireManagedTelemetry({ environment, home, cwd, supervisorId: `${host}-${process.pid}-${randomUUID()}` })
       : null;
@@ -489,14 +495,17 @@ export async function runManagedClient({ host, command, args, environment = proc
         if (identity.sessionId) {
           await bindManagedClientIdentity({ host, sessionId: identity.sessionId, clientId: routedClientId, home });
         }
-        const resident = await ensureCodexAppServerResident({ command, cwd, environment, home, clientId: routedClientId });
+        const resident = await ensureCodexAppServerResident({ command, cwd, environment: isolatedEnvironment, home, clientId: routedClientId });
+        const residentRoutes = residentControlDir(home, routedClientId);
+        await resetCodexRootSession(residentRoutes, { sessionId: codexRootSessionId, clientId: routedClientId });
         const tui = spawn(command, [...args, "--remote", resident.proxyUrl], {
           cwd,
           env: {
             ...isolatedEnvironment,
-            STATEWRIGHT_ROUTE_CONTROL_DIR: residentControlDir(home, routedClientId),
+            STATEWRIGHT_ROUTE_CONTROL_DIR: residentRoutes,
             STATEWRIGHT_MANAGED_CLIENT_HOST: host,
             STATEWRIGHT_CLIENT_ID: routedClientId,
+            ...(codexRootSessionId ? { STATEWRIGHT_MANAGED_CODEX_ROOT_SESSION_ID: codexRootSessionId } : {}),
             STATEWRIGHT_MANAGED_TELEMETRY_OWNER: telemetry ? "supervisor" : "none",
           },
           stdio: "inherit",
@@ -519,6 +528,9 @@ export async function runManagedClient({ host, command, args, environment = proc
       if (routedClientId) childEnvironment.STATEWRIGHT_CLIENT_ID = routedClientId;
       if (host === "claude" && claudeRootSessionId) {
         childEnvironment.STATEWRIGHT_MANAGED_CLAUDE_ROOT_SESSION_ID = claudeRootSessionId;
+      }
+      if (host === "codex" && codexRootSessionId) {
+        childEnvironment.STATEWRIGHT_MANAGED_CODEX_ROOT_SESSION_ID = codexRootSessionId;
       }
       if (bridge) {
         childEnvironment.STATEWRIGHT_MANAGED_MCP_URL = bridge.url;
@@ -568,6 +580,14 @@ export async function runManagedClient({ host, command, args, environment = proc
               process.stderr.write("[statewright] deferred Claude model route from a native fork; the parent session remains authoritative.\n");
               continue;
             }
+          }
+          if (host === "codex") {
+            const registration = await readCodexRootSession(controlDir, routedClientId);
+            if (!codexRouteOwnsRoot(request, registration)) {
+              process.stderr.write("[statewright] deferred Codex model route from a nested process; the parent thread remains authoritative.\n");
+              continue;
+            }
+            codexRootSessionId = registration.sessionId;
           }
           await bindManagedClientIdentity({
             host,

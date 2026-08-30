@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startCodexAppServerRuntime } from "./codex-app-server-transport.mjs";
 import { createErrorReporter, isExpectedPluginError } from "./error-reporting.mjs";
-import { writeManagedControlIdentity } from "./managed-client-identity.mjs";
+import { codexRouteOwnsRoot, readCodexRootSession, writeManagedControlIdentity } from "./managed-client-identity.mjs";
 import { ManagedMcpBridge } from "./managed-mcp-bridge.mjs";
 import { resolveApiKey } from "./remote-client.mjs";
 import { createTelemetryWriter } from "./telemetry.mjs";
@@ -18,6 +18,7 @@ const RESIDENT_RUNTIME_FILES = [
   join(EXECUTOR_ROOT, "codex-app-server-transport.mjs"),
   join(EXECUTOR_ROOT, "codex-app-server-route-proxy.mjs"),
   join(EXECUTOR_ROOT, "error-reporting.mjs"),
+  join(EXECUTOR_ROOT, "managed-client-identity.mjs"),
 ];
 
 function safeName(value) {
@@ -75,15 +76,20 @@ async function writeManifest(path, value) {
   await rename(temporary, path);
 }
 
-async function nextRouteRequest(controlDir, clientId) {
+export async function nextCodexResidentRouteRequest(controlDir, clientId, threadId = null) {
   const { readdir } = await import("node:fs/promises");
   const entries = (await readdir(controlDir)).filter((name) => name === "route.json" || name.endsWith(".route.json")).sort();
   for (const name of entries) {
     const path = join(controlDir, name);
     const request = JSON.parse(await readFile(path, "utf8"));
+    const registration = await readCodexRootSession(controlDir, clientId);
+    if (codexRouteOwnsRoot(request, registration)) {
+      if (threadId && request.session_id !== threadId) return null;
+      await unlink(path).catch(() => {});
+      return request;
+    }
     await unlink(path).catch(() => {});
-    if (request.client_id === clientId) return request;
-    process.stderr.write("[statewright] discarded route request with a mismatched managed client identity.\n");
+    process.stderr.write("[statewright] discarded route request outside the attached Codex root session.\n");
   }
   return null;
 }
@@ -163,7 +169,7 @@ async function main() {
       STATEWRIGHT_MANAGED_MCP_URL: bridge.url,
       STATEWRIGHT_MANAGED_MCP_TOKEN: bridge.token,
     },
-    nextRouteRequest: () => nextRouteRequest(controlDir, clientId),
+    nextRouteRequest: (threadId) => nextCodexResidentRouteRequest(controlDir, clientId, threadId),
     telemetry: telemetryWriter(process.env),
     reporter,
   });

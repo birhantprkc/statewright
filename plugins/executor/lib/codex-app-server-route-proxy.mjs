@@ -11,6 +11,9 @@ function sameRouteValue(actual, expected) {
 
 export function applyRouteToTurnStart(message, route) {
   if (message?.method !== "turn/start" || !route) return { message, receipt: null };
+  const threadId = String(message.params?.threadId ?? "");
+  const routeSessionId = String(route.session_id ?? "");
+  if (!threadId || !routeSessionId || threadId !== routeSessionId) return { message, receipt: null };
   const model = routeModel(route.model);
   if (!model) throw new Error("Statewright App Server route is missing a model.");
   const params = { ...(message.params ?? {}), model };
@@ -20,7 +23,7 @@ export function applyRouteToTurnStart(message, route) {
     message: routed,
     receipt: {
       route,
-      threadId: String(params.threadId ?? ""),
+      threadId,
       requestedModel: String(route.model),
       effectiveModel: model,
       effectiveEffort: route.effort ?? null,
@@ -123,7 +126,7 @@ export async function startCodexAppServerRouteProxy({
         payload = JSON.stringify(message);
         if (compacted) void onConnection({ direction: "native_to_upstream", method: `thread/resume [last ${resumeHistoryLimit} turns]` });
         if (message.method === "turn/start") {
-          const route = await takePendingRoute();
+          const route = await takePendingRoute(String(message.params?.threadId ?? ""));
           const applied = applyRouteToTurnStart(message, route);
           payload = JSON.stringify(applied.message);
           if (applied.receipt) {
