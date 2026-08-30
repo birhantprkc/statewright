@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
-import { bootstrapManagedClients, installManagedClientShim, managedClientEnabled, runManagedClient, setManagedClientEnabled, uninstallManagedClients } from "./lib/managed-client-supervisor.mjs";
+import { bootstrapManagedClients, installManagedClientShim, managedClientChildEnvironment, managedClientEnabled, runManagedClient, setManagedClientEnabled, uninstallManagedClients } from "./lib/managed-client-supervisor.mjs";
 import { createErrorReporter, isExpectedExit, isExpectedPluginError } from "./lib/error-reporting.mjs";
 
 const launcherPath = fileURLToPath(import.meta.url);
@@ -72,7 +72,7 @@ async function main() {
   }
   const child = spawn(options.realBin, options.args, {
     stdio: "inherit",
-    env: process.env,
+    env: managedClientChildEnvironment({ host: options.host }),
     cwd: process.cwd(),
     shell: process.platform === "win32",
   });

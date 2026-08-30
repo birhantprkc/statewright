@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { bindManagedClientIdentity, resolveManagedClientIdentity } from "../lib/managed-client-identity.mjs";
-import { bootstrapManagedClients, buildRoutedArgs, managedClientEnabled, resolveRealBinary, routeClaudeModel, runManagedClient, setManagedClientEnabled, uninstallManagedClients } from "../lib/managed-client-supervisor.mjs";
+import { bootstrapManagedClients, buildRoutedArgs, codexOneShotInvocation, managedClientChildEnvironment, managedClientEnabled, resolveRealBinary, routeClaudeModel, runManagedClient, setManagedClientEnabled, uninstallManagedClients } from "../lib/managed-client-supervisor.mjs";
 
 function fakeBridgeFactory() {
   return {
@@ -37,6 +39,189 @@ test("managed identity persists a fresh session for a later Codex resume", async
     assert.equal(resumed.clientId, fresh.clientId);
     assert.equal(resumed.restored, true);
   } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("nested Codex launches discard parent thread and managed-control identities", () => {
+  const child = managedClientChildEnvironment({
+    host: "codex",
+    environment: {
+      PATH: "/usr/bin",
+      STATEWRIGHT_API_KEY: "keep-auth-config",
+      STATEWRIGHT_GATEWAY_URL: "https://mcp.statewright.ai",
+      CODEX_SESSION_ID: "parent-session",
+      CODEX_THREAD_ID: "parent-thread",
+      STATEWRIGHT_CLIENT_ID: "swc_parent",
+      STATEWRIGHT_MCP_SESSION_ID: "parent-mcp-session",
+      STATEWRIGHT_ROUTE_CONTROL_DIR: "/tmp/parent-control",
+      STATEWRIGHT_MANAGED_CLIENT_HOST: "codex",
+      STATEWRIGHT_MANAGED_MCP_URL: "http://127.0.0.1:1000",
+      STATEWRIGHT_MANAGED_MCP_SESSION_ID: "parent-managed-session",
+      STATEWRIGHT_MANAGED_MCP_TOKEN: "parent-bridge-token",
+      STATEWRIGHT_MANAGED_TELEMETRY_OWNER: "supervisor",
+    },
+    overrides: {
+      STATEWRIGHT_CLIENT_ID: "swc_child",
+      STATEWRIGHT_ROUTE_CONTROL_DIR: "/tmp/child-control",
+    },
+  });
+  assert.equal(child.CODEX_SESSION_ID, undefined);
+  assert.equal(child.CODEX_THREAD_ID, undefined);
+  assert.equal(child.STATEWRIGHT_MCP_SESSION_ID, undefined);
+  assert.equal(child.STATEWRIGHT_MANAGED_MCP_URL, undefined);
+  assert.equal(child.STATEWRIGHT_MANAGED_MCP_SESSION_ID, undefined);
+  assert.equal(child.STATEWRIGHT_MANAGED_MCP_TOKEN, undefined);
+  assert.equal(child.STATEWRIGHT_MANAGED_TELEMETRY_OWNER, undefined);
+  assert.equal(child.STATEWRIGHT_CLIENT_ID, "swc_child");
+  assert.equal(child.STATEWRIGHT_ROUTE_CONTROL_DIR, "/tmp/child-control");
+  assert.equal(child.STATEWRIGHT_API_KEY, "keep-auth-config");
+  assert.equal(child.STATEWRIGHT_GATEWAY_URL, "https://mcp.statewright.ai");
+  assert.equal(child.PATH, "/usr/bin");
+});
+
+test("Codex one-shot classification follows the top-level command grammar", () => {
+  for (const args of [
+    ["exec", "review this diff"],
+    ["e", "review this diff"],
+    ["review", "--uncommitted"],
+    ["--search", "exec", "review this diff"],
+    ["--image", "one.png", "two.png", "exec", "review this diff"],
+    ["-m", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "exec", "review this diff"],
+  ]) assert.equal(codexOneShotInvocation("codex", args), true, args.join(" "));
+
+  for (const args of [
+    ["resume", "thread-1", "exec"],
+    ["--", "exec"],
+    ["-m", "exec", "resume", "thread-1"],
+    ["--enable", "exec", "resume", "thread-1"],
+    ["--disable", "review", "resume", "thread-1"],
+    ["-i", "one.png", "two.png", "resume", "thread-1"],
+    ["continue with the review"],
+  ]) assert.equal(codexOneShotInvocation("codex", args), false, args.join(" "));
+  assert.equal(codexOneShotInvocation("claude", ["exec", "review this diff"]), false);
+});
+
+test("managed Codex child receives a fresh identity instead of the parent writer identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "statewright-managed-nested-codex-"));
+  const fake = join(root, "fake-codex.mjs");
+  const captured = join(root, "environment.json");
+  try {
+    await writeFile(fake, `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(captured)}, JSON.stringify({ codex_session_id: process.env.CODEX_SESSION_ID ?? null, codex_thread_id: process.env.CODEX_THREAD_ID ?? null, statewright_client_id: process.env.STATEWRIGHT_CLIENT_ID ?? null, statewright_control_dir: process.env.STATEWRIGHT_ROUTE_CONTROL_DIR ?? null, managed_mcp_url: process.env.STATEWRIGHT_MANAGED_MCP_URL ?? null }));\n`);
+    await chmod(fake, 0o755);
+    assert.equal(await runManagedClient({
+      host: "codex",
+      command: fake,
+      args: ["exec", "review this diff"],
+      environment: {
+        PATH: process.env.PATH,
+        STATEWRIGHT_API_KEY: "test",
+        CODEX_SESSION_ID: "parent-session",
+        CODEX_THREAD_ID: "parent-thread",
+        STATEWRIGHT_CLIENT_ID: "swc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        STATEWRIGHT_ROUTE_CONTROL_DIR: "/tmp/parent-control",
+        STATEWRIGHT_MANAGED_MCP_URL: "http://127.0.0.1:1000",
+      },
+      home: root,
+      pollMs: 5,
+      bridgeFactory: fakeBridgeFactory,
+    }), 0);
+    const environment = JSON.parse(await readFile(captured, "utf8"));
+    assert.equal(environment.codex_session_id, null);
+    assert.equal(environment.codex_thread_id, null);
+    assert.match(environment.statewright_client_id, /^swc_[a-f0-9]{32}$/);
+    assert.notEqual(environment.statewright_client_id, "swc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    assert.notEqual(environment.statewright_control_dir, "/tmp/parent-control");
+    assert.equal(environment.managed_mcp_url, "http://127.0.0.1:9999");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("managed codex exec remains one-shot when its hook requests a model route", async () => {
+  const root = await mkdtemp(join(tmpdir(), "statewright-managed-codex-exec-"));
+  const fake = join(root, "fake-codex.mjs");
+  const calls = join(root, "calls.log");
+  try {
+    await writeFile(fake, `#!/usr/bin/env node\nimport { appendFileSync, writeFileSync } from "node:fs";\nimport { join } from "node:path";\nappendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + "\\n");\nwriteFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "route.json"), JSON.stringify({ session_id: "review-thread", client_id: process.env.STATEWRIGHT_CLIENT_ID, model: "openai-codex/gpt-5.6-sol", effort: "high" }));\nsetTimeout(() => process.exit(0), 80);\n`);
+    await chmod(fake, 0o755);
+    assert.equal(await runManagedClient({
+      host: "codex",
+      command: fake,
+      args: ["exec", "review this diff"],
+      environment: { PATH: process.env.PATH, STATEWRIGHT_API_KEY: "test" },
+      home: root,
+      pollMs: 5,
+      bridgeFactory: fakeBridgeFactory,
+    }), 0);
+    assert.deepEqual((await readFile(calls, "utf8")).trim().split("\n"), ["exec review this diff"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("terminating a managed codex exec stops its child and removes its control directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "statewright-managed-codex-cancel-"));
+  const fake = join(root, "fake-codex.mjs");
+  const harness = join(root, "harness.mjs");
+  const captured = join(root, "child.json");
+  const supervisor = fileURLToPath(new URL("../lib/managed-client-supervisor.mjs", import.meta.url));
+  const waitUntil = async (predicate, timeoutMs = 3_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await predicate()) return true;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+    return false;
+  };
+  try {
+    await writeFile(fake, `#!/usr/bin/env node\nimport { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nconst grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\nwriteFileSync(${JSON.stringify(captured)}, JSON.stringify({ pid: process.pid, grandchild_pid: grandchild.pid, control: process.env.STATEWRIGHT_ROUTE_CONTROL_DIR }));\nsetInterval(() => {}, 1000);\n`);
+    await chmod(fake, 0o755);
+    await writeFile(harness, `import { runManagedClient } from ${JSON.stringify(new URL(`file://${supervisor}`).href)};\nconst bridgeFactory = () => ({ async start() { this.url = "http://127.0.0.1:9999"; this.token = "test-token"; }, async close() {} });\nprocess.exitCode = await runManagedClient({ host: "codex", command: ${JSON.stringify(fake)}, args: ["exec", "review"], environment: { ...process.env, STATEWRIGHT_API_KEY: "test", STATEWRIGHT_SENTRY_DISABLED: "true" }, home: ${JSON.stringify(root)}, pollMs: 5, bridgeFactory });\n`);
+    const wrapper = spawn(process.execPath, [harness], { stdio: "ignore" });
+    assert.equal(await waitUntil(async () => access(captured).then(() => true, () => false)), true);
+    const child = JSON.parse(await readFile(captured, "utf8"));
+    wrapper.kill("SIGTERM");
+    const result = await new Promise((resolveResult, rejectResult) => {
+      wrapper.once("error", rejectResult);
+      wrapper.once("exit", (code, signal) => resolveResult({ code, signal }));
+    });
+    assert.deepEqual(result, { code: 1, signal: null });
+    for (const pid of [child.pid, child.grandchild_pid]) {
+      assert.equal(await waitUntil(async () => {
+        try { process.kill(pid, 0); return false; } catch { return true; }
+      }), true, `process ${pid} survived managed cancellation`);
+    }
+    assert.equal(await access(child.control).then(() => true, () => false), false);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("disabled managed-client wrapper does not leak its parent Codex writer identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "statewright-unmanaged-nested-codex-"));
+  const fake = join(root, "fake-codex.mjs");
+  const captured = join(root, "environment.json");
+  const launcher = fileURLToPath(new URL("../statewright-managed-client.mjs", import.meta.url));
+  try {
+    await writeFile(fake, `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(captured)}, JSON.stringify({ codex_session_id: process.env.CODEX_SESSION_ID ?? null, codex_thread_id: process.env.CODEX_THREAD_ID ?? null, statewright_client_id: process.env.STATEWRIGHT_CLIENT_ID ?? null, statewright_control_dir: process.env.STATEWRIGHT_ROUTE_CONTROL_DIR ?? null }));\n`);
+    await chmod(fake, 0o755);
+    const result = await new Promise((resolveResult, rejectResult) => {
+      const child = spawn(process.execPath, [launcher, "--host", "codex", "--real-bin", fake, "--", "exec", "review this diff"], {
+        env: {
+          ...process.env,
+          HOME: root,
+          STATEWRIGHT_ERROR_DSN: "",
+          CODEX_SESSION_ID: "parent-session",
+          CODEX_THREAD_ID: "parent-thread",
+          STATEWRIGHT_CLIENT_ID: "swc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          STATEWRIGHT_ROUTE_CONTROL_DIR: "/tmp/parent-control",
+        },
+        stdio: "ignore",
+      });
+      child.once("error", rejectResult);
+      child.once("exit", (code, signal) => resolveResult({ code, signal }));
+    });
+    assert.deepEqual(result, { code: 0, signal: null });
+    assert.deepEqual(JSON.parse(await readFile(captured, "utf8")), {
+      codex_session_id: null,
+      codex_thread_id: null,
+      statewright_client_id: null,
+      statewright_control_dir: null,
+    });
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("Codex restart preserves non-route args and applies the requested route", () => {

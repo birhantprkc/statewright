@@ -13,6 +13,31 @@ import { createErrorReporter, isExpectedExit } from "./error-reporting.mjs";
 const CONTINUATION_PROMPT = "Continue the active Statewright workflow in its current state. Use statewright_get_state first.";
 const EXECUTOR_ROOT = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_TELEMETRY_AGENT = resolve(EXECUTOR_ROOT, "../../codex/scripts/local-telemetry-agent.mjs");
+const PARENT_MANAGED_IDENTITY_ENV = [
+  "STATEWRIGHT_CLIENT_ID",
+  "STATEWRIGHT_MCP_SESSION_ID",
+  "STATEWRIGHT_ROUTE_CONTROL_DIR",
+  "STATEWRIGHT_MANAGED_CLIENT_HOST",
+  "STATEWRIGHT_MANAGED_CLAUDE_ROOT_SESSION_ID",
+  "STATEWRIGHT_MANAGED_MCP_URL",
+  "STATEWRIGHT_MANAGED_MCP_SESSION_ID",
+  "STATEWRIGHT_MANAGED_MCP_TOKEN",
+  "STATEWRIGHT_MANAGED_TELEMETRY_OWNER",
+];
+
+export function managedClientChildEnvironment({ host, environment = process.env, overrides = {} }) {
+  const childEnvironment = { ...environment };
+  for (const name of PARENT_MANAGED_IDENTITY_ENV) delete childEnvironment[name];
+  if (host === "codex") {
+    // Codex exposes the active TUI identity to tools. A nested `codex exec`
+    // must create its own thread instead of presenting the parent's active
+    // writer identity to another Codex process. Explicit resumes carry their
+    // target thread in argv and do not need either inherited variable.
+    delete childEnvironment.CODEX_SESSION_ID;
+    delete childEnvironment.CODEX_THREAD_ID;
+  }
+  return { ...childEnvironment, ...overrides };
+}
 
 function telemetryDirectory(environment, home) {
   return environment.STATEWRIGHT_TELEMETRY_DIR ?? join(home, ".statewright", "telemetry", "native-codex");
@@ -250,10 +275,17 @@ function signalChildGroup(child, signal, { platform = process.platform, spawnImp
 }
 
 function waitForChildExit(exit, milliseconds) {
-  return Promise.race([
-    exit.then(() => true),
-    delay(milliseconds).then(() => false),
-  ]);
+  return new Promise((resolveWait) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveWait(result);
+    };
+    const timer = setTimeout(() => finish(false), milliseconds);
+    exit.then(() => finish(true));
+  });
 }
 
 async function restartManagedChild(child, exit, { command, platform = process.platform } = {}) {
@@ -273,6 +305,73 @@ async function restartManagedChild(child, exit, { command, platform = process.pl
 
 function routeModel(model) {
   return String(model ?? "").replace(/^[^/]+\//, "");
+}
+
+const CODEX_OPTIONS_WITH_VALUE = new Set([
+  "-a", "--ask-for-approval", "-C", "--cd", "-c", "--config",
+  "--disable", "--enable", "--local-provider", "-m", "--model", "-p", "--profile", "--remote",
+  "--remote-auth-token-env", "-s", "--sandbox", "--add-dir",
+]);
+const CODEX_TOP_LEVEL_COMMANDS = new Set([
+  "agents", "app", "app-server", "apply", "archive", "cloud", "completion", "debug", "delete",
+  "doctor", "e", "exec", "exec-server", "features", "fork", "help", "login", "logout", "mcp",
+  "mcp-server", "migrate-rollouts", "plugin", "queue", "remote-control", "resume", "review", "sandbox",
+  "unarchive", "update",
+]);
+
+export function codexOneShotInvocation(host, args) {
+  if (host !== "codex") return false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    // `--` ends option/subcommand parsing; any following `exec` is prompt text.
+    if (argument === "--") return false;
+    if (argument.startsWith("-") && argument.includes("=")) continue;
+    if (argument === "-i" || argument === "--image") {
+      // Clap accepts one or more image paths. Stop only when the next token is
+      // another option or a real top-level Codex command.
+      while (index + 1 < args.length) {
+        const candidate = args[index + 1];
+        if (candidate === "--" || candidate.startsWith("-") || CODEX_TOP_LEVEL_COMMANDS.has(candidate)) break;
+        index += 1;
+      }
+      continue;
+    }
+    if (CODEX_OPTIONS_WITH_VALUE.has(argument)) {
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("-")) continue;
+    // Codex advertises `e` as the exec alias and `review` as a separate
+    // non-interactive top-level command. Any other first positional token is
+    // either an interactive command (including resume) or its prompt.
+    return argument === "exec" || argument === "e" || argument === "review";
+  }
+  return false;
+}
+
+function forwardManagedTermination(child, exit, { command, platform = process.platform } = {}) {
+  let termination = null;
+  const forward = (signal) => {
+    termination ??= (async () => {
+      if (isWindowsCommand(command, platform)) {
+        signalChildGroup(child, "SIGTERM", { platform });
+      } else {
+        signalChildGroup(child, signal, { platform });
+      }
+      if (await waitForChildExit(exit, 1_500)) return;
+      signalChildGroup(child, "SIGTERM", { platform });
+      await waitForChildExit(exit, 1_500);
+    })();
+  };
+  const onSigint = () => forward("SIGINT");
+  const onSigterm = () => forward("SIGTERM");
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+  return async () => {
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onSigterm);
+    await termination;
+  };
 }
 
 export function routeClaudeModel(model) {
@@ -359,6 +458,7 @@ export async function runManagedClient({ host, command, args, environment = proc
   const cmdShim = await resolveWindowsCmdShim(command);
   const launchCommand = cmdShim?.command ?? command;
   const launchPrefixArgs = cmdShim?.prefixArgs ?? [];
+  const oneShotCodexExec = codexOneShotInvocation(host, args);
   const controlDir = await mkdtemp(join(tmpdir(), `statewright-${host}-route-`));
   const consumed = new Set();
   let nextArgs = args;
@@ -372,11 +472,12 @@ export async function runManagedClient({ host, command, args, environment = proc
   try {
     const identity = await resolveManagedClientIdentity({ host, args, home });
     const routedClientId = identity.clientId;
+    const isolatedEnvironment = managedClientChildEnvironment({ host, environment });
     await writeManagedControlIdentity(controlDir, { host, clientId: routedClientId });
     telemetry = host === "codex"
       ? await acquireManagedTelemetry({ environment, home, cwd, supervisorId: `${host}-${process.pid}-${randomUUID()}` })
       : null;
-    if (host === "codex") {
+    if (host === "codex" && !oneShotCodexExec) {
       // Claude receives a compact copy of this shared supervisor. Keep the
       // optional Codex-only transport out of its module-load graph.
       const { codexAppServerTransportEnabled } = await import("./codex-app-server-transport.mjs");
@@ -392,7 +493,7 @@ export async function runManagedClient({ host, command, args, environment = proc
         const tui = spawn(command, [...args, "--remote", resident.proxyUrl], {
           cwd,
           env: {
-            ...environment,
+            ...isolatedEnvironment,
             STATEWRIGHT_ROUTE_CONTROL_DIR: residentControlDir(home, routedClientId),
             STATEWRIGHT_MANAGED_CLIENT_HOST: host,
             STATEWRIGHT_CLIENT_ID: routedClientId,
@@ -410,7 +511,7 @@ export async function runManagedClient({ host, command, args, environment = proc
     bridge = await createManagedMcpBridge({ environment, clientId: routedClientId, bridgeFactory });
     while (true) {
       const childEnvironment = {
-        ...environment,
+        ...isolatedEnvironment,
         STATEWRIGHT_ROUTE_CONTROL_DIR: controlDir,
         STATEWRIGHT_MANAGED_CLIENT_HOST: host,
         STATEWRIGHT_MANAGED_TELEMETRY_OWNER: telemetry ? "supervisor" : "none",
@@ -428,6 +529,9 @@ export async function runManagedClient({ host, command, args, environment = proc
         cwd,
         env: childEnvironment,
         stdio: "inherit",
+        // POSIX process-group ownership lets cancellation terminate every
+        // descendant the CLI starts. Scoped forwarding above prevents that
+        // detached group from outliving a one-shot supervisor.
         detached: process.platform !== "win32",
         // Non-npm .cmd/.bat launchers still need cmd.exe. npm-generated shims
         // are resolved to their Node entrypoint above, preserving argv exactly.
@@ -437,6 +541,18 @@ export async function runManagedClient({ host, command, args, environment = proc
       let restart = false;
       child.once("exit", () => { exited = true; });
       const exit = waitForExit(child);
+      if (oneShotCodexExec) {
+        const stopForwarding = forwardManagedTermination(child, exit, { command: launchCommand });
+        try {
+          const result = await exit;
+          if (!isExpectedExit(result)) await reporter.report(new Error("Managed codex exec exited unexpectedly."), {
+            mechanism: "child_exit", host, operation: "managed_exec", exit_code: result.code ?? 1, signal: result.signal,
+          });
+          return result.code ?? 1;
+        } finally {
+          await stopForwarding();
+        }
+      }
       while (!exited) {
         const request = await nextRouteRequest(controlDir, consumed).catch(() => null);
         if (request) {
