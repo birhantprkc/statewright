@@ -41,6 +41,63 @@ test("managed identity persists a fresh session for a later Codex resume", async
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
+test("managed Codex resume runs the history guard before spawning the native client", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-managed-history-guard-"));
+  const fake = join(home, "fake-codex.mjs");
+  const spawned = join(home, "spawned");
+  const calls = [];
+  try {
+    await writeFile(fake, `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(spawned)}, "yes");\n`);
+    await chmod(fake, 0o755);
+    assert.equal(await runManagedClient({
+      host: "codex",
+      command: fake,
+      args: ["resume", "durable-thread"],
+      environment: { PATH: process.env.PATH, STATEWRIGHT_API_KEY: "test" },
+      home,
+      pollMs: 5,
+      bridgeFactory: fakeBridgeFactory,
+      historyGuard: async (options) => {
+        calls.push(options);
+        assert.equal(await access(spawned).then(() => true, () => false), false);
+        return { status: "healthy" };
+      },
+    }), 0);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].home, home);
+    assert.equal(calls[0].cwd, process.cwd());
+    assert.deepEqual(calls[0].args, ["resume", "durable-thread"]);
+    assert.equal(calls[0].environment.STATEWRIGHT_API_KEY, "test");
+    assert.equal(calls[0].sessionId, "durable-thread");
+    assert.equal(calls[0].mode, "guard");
+    await access(spawned);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("resident App Server preflights Codex history before starting resident infrastructure", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-resident-history-guard-"));
+  const fake = join(home, "fake-codex.mjs");
+  const spawned = join(home, "resident-started");
+  try {
+    await writeFile(fake, `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(spawned)}, "yes");\n`);
+    await chmod(fake, 0o755);
+    await assert.rejects(
+      runManagedClient({
+        host: "codex",
+        command: fake,
+        args: ["resume", "durable-thread"],
+        environment: { PATH: process.env.PATH, STATEWRIGHT_API_KEY: "test", STATEWRIGHT_CODEX_TRANSPORT: "app-server" },
+        home,
+        pollMs: 5,
+        bridgeFactory: fakeBridgeFactory,
+        historyGuard: async () => { throw new Error("stop before resident"); },
+      }),
+      /stop before resident/,
+    );
+    assert.equal(await access(spawned).then(() => true, () => false), false);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
 test("Codex resume selectors are not mistaken for durable session IDs", () => {
   assert.equal(resumedSessionId("codex", ["resume", "--last"]), null);
   assert.equal(resumedSessionId("codex", ["resume", "--all"]), null);
@@ -387,16 +444,26 @@ test("managed supervisor preserves its own identity across a routed restart", as
   const root = await mkdtemp(join(tmpdir(), "statewright-managed-client-identity-"));
   const fake = join(root, "fake-codex.mjs");
   const calls = join(root, "calls.log");
+  const historyChecks = [];
   try {
     await writeFile(fake, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, writeFileSync } from "node:fs";\nimport { join } from "node:path";\nappendFileSync(${JSON.stringify(calls)}, process.env.STATEWRIGHT_CLIENT_ID + "\\n");\nconst marker = join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "once");\nif (!existsSync(marker)) { writeFileSync(marker, ""); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "codex-root-session.json"), JSON.stringify({version:1,session_id:"session-4",client_id:process.env.STATEWRIGHT_CLIENT_ID})); writeFileSync(join(process.env.STATEWRIGHT_ROUTE_CONTROL_DIR, "route.json"), JSON.stringify({session_id:"session-4",root_session_id:"session-4",client_id:process.env.STATEWRIGHT_CLIENT_ID,model:"openai-codex/gpt-5.6-sol",effort:"high"})); process.on("SIGINT", () => process.exit(0)); setInterval(() => {}, 1000); }\n`);
     await chmod(fake, 0o755);
     assert.equal(await runManagedClient({
       host: "codex", command: fake, args: [], environment: { PATH: process.env.PATH, STATEWRIGHT_API_KEY: "test" }, home: root, pollMs: 5, bridgeFactory: fakeBridgeFactory,
+      historyGuard: async (options) => { historyChecks.push(options); return { status: "healthy" }; },
     }), 0);
     const identities = (await readFile(calls, "utf8")).trim().split("\n");
     assert.equal(identities.length, 2);
     assert.equal(identities[0], identities[1]);
     assert.match(identities[0], /^swc_[a-f0-9]{32}$/);
+    assert.equal(historyChecks.length, 1);
+    assert.equal(historyChecks[0].home, root);
+    assert.equal(historyChecks[0].cwd, process.cwd());
+    assert.equal(historyChecks[0].environment.STATEWRIGHT_API_KEY, "test");
+    assert.equal(historyChecks[0].sessionId, "session-4");
+    assert.equal(historyChecks[0].mode, "guard");
+    assert.ok(historyChecks[0].args.includes("resume"));
+    assert.ok(historyChecks[0].args.includes("session-4"));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

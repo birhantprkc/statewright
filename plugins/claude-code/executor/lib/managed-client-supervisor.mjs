@@ -6,7 +6,8 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ManagedMcpBridge } from "./managed-mcp-bridge.mjs";
-import { bindManagedClientIdentity, codexRouteOwnsRoot, readCodexRootSession, resetCodexRootSession, resolveManagedClientIdentity, writeManagedControlIdentity } from "./managed-client-identity.mjs";
+import { codexHistoryRepairMode, guardCodexResumeHistory } from "./codex-history-integrity.mjs";
+import { bindManagedClientIdentity, codexRouteOwnsRoot, readCodexRootSession, resetCodexRootSession, resolveManagedClientIdentity, resumedSessionId, writeManagedControlIdentity } from "./managed-client-identity.mjs";
 import { resolveApiKey } from "./remote-client.mjs";
 import { createErrorReporter, isExpectedExit } from "./error-reporting.mjs";
 
@@ -454,7 +455,7 @@ async function nextRouteRequest(controlDir, consumed) {
   return null;
 }
 
-export async function runManagedClient({ host, command, args, environment = process.env, cwd = process.cwd(), home = homedir(), pollMs = 100, bridgeFactory = (options) => new ManagedMcpBridge(options), reporter = createErrorReporter({ plugin: host === "claude" ? "claude-code" : "codex", version: "0.3.0", environment }) }) {
+export async function runManagedClient({ host, command, args, environment = process.env, cwd = process.cwd(), home = homedir(), pollMs = 100, bridgeFactory = (options) => new ManagedMcpBridge(options), historyGuard = guardCodexResumeHistory, reporter = createErrorReporter({ plugin: host === "claude" ? "claude-code" : "codex", version: "0.3.0", environment }) }) {
   if (!["codex", "claude"].includes(host)) throw new Error(`Unsupported managed client host '${host}'.`);
   const cmdShim = await resolveWindowsCmdShim(command);
   const launchCommand = cmdShim?.command ?? command;
@@ -475,6 +476,23 @@ export async function runManagedClient({ host, command, args, environment = proc
     const identity = await resolveManagedClientIdentity({ host, args, home });
     const routedClientId = identity.clientId;
     if (host === "codex") codexRootSessionId = identity.sessionId;
+    const config = host === "codex" ? await managedClientConfig(home) : {};
+    const preflightCodexHistory = async (launchArgs) => {
+      const sessionId = host === "codex" ? resumedSessionId("codex", launchArgs) : null;
+      if (!sessionId) return { status: "not_applicable" };
+      const historyResult = await historyGuard({
+        home,
+        cwd,
+        args: launchArgs,
+        environment,
+        sessionId,
+        mode: codexHistoryRepairMode({ environment, config }),
+      });
+      if (historyResult?.status === "repaired") {
+        process.stderr.write(`[statewright] backed up and repaired ${historyResult.droppedRecords} duplicate Codex restart metadata record(s); rebuilding this thread's derived history projection.\n`);
+      }
+      return historyResult;
+    };
     const isolatedEnvironment = managedClientChildEnvironment({ host, environment });
     await writeManagedControlIdentity(controlDir, { host, clientId: routedClientId });
     if (host === "codex") {
@@ -489,16 +507,18 @@ export async function runManagedClient({ host, command, args, environment = proc
       const { codexAppServerTransportEnabled } = await import("./codex-app-server-transport.mjs");
       if (codexAppServerTransportEnabled({
         environment,
-        config: await managedClientConfig(home),
+        config,
       })) {
         const { ensureCodexAppServerResident, residentControlDir } = await import("./codex-app-server-resident.mjs");
         if (identity.sessionId) {
           await bindManagedClientIdentity({ host, sessionId: identity.sessionId, clientId: routedClientId, home });
         }
+        await preflightCodexHistory(args);
         const resident = await ensureCodexAppServerResident({ command, cwd, environment: isolatedEnvironment, home, clientId: routedClientId });
         const residentRoutes = residentControlDir(home, routedClientId);
         await resetCodexRootSession(residentRoutes, { sessionId: codexRootSessionId, clientId: routedClientId });
-        const tui = spawn(command, [...args, "--remote", resident.proxyUrl], {
+        const residentArgs = [...args, "--remote", resident.proxyUrl];
+        const tui = spawn(command, residentArgs, {
           cwd,
           env: {
             ...isolatedEnvironment,
@@ -519,6 +539,7 @@ export async function runManagedClient({ host, command, args, environment = proc
     }
     bridge = await createManagedMcpBridge({ environment, clientId: routedClientId, bridgeFactory });
     while (true) {
+      await preflightCodexHistory(nextArgs);
       const childEnvironment = {
         ...isolatedEnvironment,
         STATEWRIGHT_ROUTE_CONTROL_DIR: controlDir,

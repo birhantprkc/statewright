@@ -3,6 +3,7 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import { CLAUDE_ROOT, RUNTIME_FILES, assertRuntimeCurrent, discoverRuntimeRoots, runtimeDrift, syncRuntime, syncRuntimeWithManagedBundle } from "../scripts/sync-runtime.mjs";
 
 async function copyRuntime(sourceRoot, targetRoot) {
@@ -42,6 +43,7 @@ test("runtime sync discovers the installed cache and local directory marketplace
     await syncRuntime({ sourceRoot: CLAUDE_ROOT, targetRoots: [cache, directoryPlugin] });
     assert.deepEqual(await runtimeDrift({ sourceRoot: CLAUDE_ROOT, targetRoots: [cache, directoryPlugin] }), []);
     assert.deepEqual(await readFile(join(directoryPlugin, "mcp-proxy.sh")), await readFile(join(CLAUDE_ROOT, "mcp-proxy.sh")));
+    await import(`${pathToFileURL(join(directoryPlugin, "executor/lib/managed-client-supervisor.mjs")).href}?runtime-sync=${Date.now()}`);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

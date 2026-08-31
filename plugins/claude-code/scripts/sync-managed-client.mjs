@@ -12,6 +12,7 @@ export const MANAGED_CLIENT_FILES = [
   ["lib/error-reporting.mjs", "executor/lib/error-reporting.mjs"],
   ["statewright-managed-client.mjs", "executor/statewright-managed-client.mjs"],
   ["lib/managed-client-supervisor.mjs", "executor/lib/managed-client-supervisor.mjs"],
+  ["lib/codex-history-integrity.mjs", "executor/lib/codex-history-integrity.mjs"],
   ["lib/managed-client-identity.mjs", "executor/lib/managed-client-identity.mjs"],
   ["lib/managed-mcp-bridge.mjs", "executor/lib/managed-mcp-bridge.mjs"],
   ["lib/remote-client.mjs", "executor/lib/remote-client.mjs"],
