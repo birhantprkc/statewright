@@ -247,13 +247,29 @@ async function inspectRolloutPath(path, expectedSessionId, { requireCanonicalFil
       anomalies.push({ kind: "malformed_json", line: lineNumber });
       continue;
     }
-    if (lineNumber === 1 && (row?.ordinal !== 0 || row?.type !== "session_meta")) anomalies.push({ kind: "invalid_root_record", line: lineNumber });
+    if (!row || typeof row !== "object" || Array.isArray(row) || typeof row.type !== "string" || row.type.length === 0) {
+      anomalies.push({ kind: "invalid_record_shape", line: lineNumber });
+      keptHash.update(line).update("\n");
+      continue;
+    }
+    if (lineNumber === 1 && row?.type !== "session_meta") anomalies.push({ kind: "invalid_root_record", line: lineNumber });
     if (row?.type === "session_meta") {
       sessionMetaCount += 1;
       if (lineNumber !== 1) anomalies.push({ kind: "late_or_duplicate_session_meta", line: lineNumber });
       if (row?.payload?.id !== expectedSessionId) anomalies.push({ kind: "session_identity_mismatch", line: lineNumber });
-      historyMode = row?.payload?.history_mode ?? row?.payload?.historyMode ?? historyMode;
+      if (lineNumber === 1) {
+        const snakeMode = row?.payload?.history_mode;
+        const camelMode = row?.payload?.historyMode;
+        if (snakeMode != null && camelMode != null && snakeMode !== camelMode) anomalies.push({ kind: "conflicting_history_mode", line: lineNumber });
+        historyMode = snakeMode ?? camelMode ?? null;
+      }
     }
+    if (historyMode === "legacy") {
+      if (Object.hasOwn(row, "ordinal")) anomalies.push({ kind: "unexpected_ordinal", line: lineNumber, ordinal: row.ordinal ?? null });
+      keptHash.update(line).update("\n");
+      continue;
+    }
+    if (lineNumber === 1 && row?.ordinal !== 0) anomalies.push({ kind: "invalid_root_record", line: lineNumber });
     if (!Number.isInteger(row?.ordinal)) {
       anomalies.push({ kind: "missing_ordinal", line: lineNumber });
       keptHash.update(line).update("\n");

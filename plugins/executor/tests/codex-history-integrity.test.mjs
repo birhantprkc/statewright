@@ -18,6 +18,10 @@ function record(ordinal, type, payload) {
   return JSON.stringify({ timestamp: "2026-08-30T00:00:00.000Z", ordinal, type, payload });
 }
 
+function legacyRecord(type, payload) {
+  return JSON.stringify({ timestamp: "2026-08-30T00:00:00.000Z", type, payload });
+}
+
 async function writeRollout(home, lines) {
   const path = join(home, ".codex", "sessions", "2026", "08", "30", `rollout-2026-08-30T00-00-00-${SESSION_ID}.jsonl`);
   await mkdir(dirname(path), { recursive: true });
@@ -86,6 +90,81 @@ test("inspection classifies only repeated restart settings as safely repairable"
     assert.equal(inspection.duplicateSettingsCount, 1);
     assert.equal(inspection.unknownAnomalies.length, 0);
     assert.equal(inspection.finalOrdinal, 2);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("legacy history retains native resume behavior without mutation or backup", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-legacy-"));
+  const backupRoot = join(home, "backups");
+  try {
+    const rollout = await writeRollout(home, [
+      legacyRecord("session_meta", { id: SESSION_ID, history_mode: "legacy" }),
+      legacyRecord("event_msg", { type: "task_complete" }),
+    ]);
+    const before = await readFile(rollout, "utf8");
+    const inspection = await inspectCodexHistory({ home, sessionId: SESSION_ID });
+    assert.equal(inspection.status, "healthy");
+    assert.equal(inspection.historyMode, "legacy");
+    assert.equal(inspection.finalOrdinal, null);
+    assert.deepEqual(inspection.unknownAnomalies, []);
+
+    const result = await guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard", backupRoot });
+    assert.deepEqual(result, { status: "not_applicable", historyMode: "legacy" });
+    assert.equal(await readFile(rollout, "utf8"), before);
+    await assert.rejects(access(backupRoot));
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("legacy history still fails closed on identity or mixed-schema anomalies", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-legacy-unsafe-"));
+  try {
+    const rollout = await writeRollout(home, [
+      legacyRecord("session_meta", { id: "01a0531f-2295-7852-b575-f9d4c2c1201c", history_mode: "legacy" }),
+      legacyRecord("event_msg", { type: "task_complete" }),
+    ]);
+    let inspection = await inspectCodexHistory({ home, sessionId: SESSION_ID });
+    assert.equal(inspection.status, "unsafe");
+    assert.equal(inspection.unknownAnomalies.some((item) => item.kind === "session_identity_mismatch"), true);
+
+    await writeFile(rollout, `${[
+      legacyRecord("session_meta", { id: SESSION_ID, history_mode: "legacy" }),
+      record(1, "event_msg", { type: "task_complete" }),
+    ].join("\n")}\n`);
+    inspection = await inspectCodexHistory({ home, sessionId: SESSION_ID });
+    assert.equal(inspection.status, "unsafe");
+    assert.equal(inspection.unknownAnomalies.some((item) => item.kind === "unexpected_ordinal"), true);
+    await assert.rejects(
+      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard" }),
+      /canonical identity or ordinal contract/i,
+    );
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("legacy history rejects non-record JSON and conflicting mode aliases", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-legacy-shape-"));
+  try {
+    const rollout = await writeRollout(home, []);
+    for (const invalidRecord of [{}, [], "corrupt", null]) {
+      await writeFile(rollout, `${[
+        legacyRecord("session_meta", { id: SESSION_ID, history_mode: "legacy" }),
+        JSON.stringify(invalidRecord),
+      ].join("\n")}\n`);
+      const inspection = await inspectCodexHistory({ home, sessionId: SESSION_ID });
+      assert.equal(inspection.status, "unsafe");
+      assert.equal(inspection.unknownAnomalies.some((item) => item.kind === "invalid_record_shape"), true);
+    }
+
+    await writeFile(rollout, `${[
+      legacyRecord("session_meta", { id: SESSION_ID, history_mode: "legacy", historyMode: "paginated" }),
+      legacyRecord("event_msg", { type: "task_complete" }),
+    ].join("\n")}\n`);
+    const inspection = await inspectCodexHistory({ home, sessionId: SESSION_ID });
+    assert.equal(inspection.status, "unsafe");
+    assert.equal(inspection.unknownAnomalies.some((item) => item.kind === "conflicting_history_mode"), true);
+    await assert.rejects(
+      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard" }),
+      /canonical identity or ordinal contract/i,
+    );
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 

@@ -26,6 +26,12 @@ fail-closed. Healthy, missing, non-paginated, selector-based, and non-UUID
 resumes retain native behavior. A malformed record, ordinal gap, regression,
 or ambiguous rollout is never repaired automatically.
 
+Legacy rollouts are validated against their own canonical contract: one root
+`session_meta` with the requested identity, record-shaped JSON objects with
+non-empty types, no ordinal fields, unambiguous mode metadata, and a canonical
+final newline. They never enter the paginated repair path. A file that mixes
+legacy metadata with paginated ordinals fails closed.
+
 The sole repairable anomaly is an `event_msg/thread_settings_applied` record
 whose ordinal exactly repeats the immediately preceding ordinal. When the user
 opts into `auto` repair, Statewright:
