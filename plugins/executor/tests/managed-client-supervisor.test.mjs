@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { bindManagedClientIdentity, resolveManagedClientIdentity, resumedSessionId } from "../lib/managed-client-identity.mjs";
-import { bootstrapManagedClients, buildRoutedArgs, codexOneShotInvocation, managedClientChildEnvironment, managedClientEnabled, resolveRealBinary, routeClaudeModel, runManagedClient, setManagedClientEnabled, uninstallManagedClients } from "../lib/managed-client-supervisor.mjs";
+import { bootstrapManagedClients, buildRoutedArgs, codexAllSessionsRequested, codexOneShotInvocation, managedClientChildEnvironment, managedClientEnabled, resolveRealBinary, routeClaudeModel, runManagedClient, setManagedClientEnabled, uninstallManagedClients } from "../lib/managed-client-supervisor.mjs";
 
 function fakeBridgeFactory() {
   return {
@@ -108,6 +108,12 @@ test("Codex resume selectors are not mistaken for durable session IDs", () => {
   assert.equal(resumedSessionId("codex", ["--profile", "resume", "fix-it"]), null);
   assert.equal(resumedSessionId("codex", ["-m", "resume", "fix-it"]), null);
   assert.equal(resumedSessionId("codex", ["-m", "gpt-5.6-sol", "resume", "durable-thread"]), "durable-thread");
+});
+
+test("Codex global resume scope is explicit and ignores prompt text after --", () => {
+  assert.equal(codexAllSessionsRequested(["resume"]), false);
+  assert.equal(codexAllSessionsRequested(["resume", "--all"]), true);
+  assert.equal(codexAllSessionsRequested(["resume", "--", "--all"]), false);
 });
 
 test("nested Codex launches discard parent thread and managed-control identities", () => {
@@ -259,6 +265,42 @@ test("terminating a managed codex exec stops its child and removes its control d
     }
     assert.equal(await access(child.control).then(() => true, () => false), false);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("losing a POSIX terminal stops an interactive managed client process group", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "statewright-managed-codex-sighup-"));
+  const fake = join(root, "fake-codex.mjs");
+  const harness = join(root, "harness.mjs");
+  const captured = join(root, "child.json");
+  const ready = join(root, "parent-ready");
+  const supervisor = fileURLToPath(new URL("../lib/managed-client-supervisor.mjs", import.meta.url));
+  let child = null;
+  try {
+    await writeFile(fake, `#!/usr/bin/env node\nimport { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nconst grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\nwriteFileSync(${JSON.stringify(captured)}, JSON.stringify({ pid: process.pid, grandchild_pid: grandchild.pid, control: process.env.STATEWRIGHT_ROUTE_CONTROL_DIR }));\nsetInterval(() => {}, 1000);\n`);
+    await chmod(fake, 0o755);
+    await writeFile(harness, `import { writeFileSync } from "node:fs";\nimport { runManagedClient } from ${JSON.stringify(new URL(`file://${supervisor}`).href)};\nconst bridgeFactory = () => ({ async start() { this.url = "http://127.0.0.1:9999"; this.token = "test-token"; }, async close() {} });\nconst running = runManagedClient({ host: "codex", command: ${JSON.stringify(fake)}, args: ["resume"], environment: { ...process.env, STATEWRIGHT_API_KEY: "test", STATEWRIGHT_SENTRY_DISABLED: "true", STATEWRIGHT_CODEX_TRANSPORT: "restart" }, home: ${JSON.stringify(root)}, pollMs: 5, bridgeFactory });\nconst readiness = setInterval(() => { if (process.listenerCount("SIGHUP") > 0) { writeFileSync(${JSON.stringify(ready)}, "yes"); clearInterval(readiness); } }, 5);\nprocess.exitCode = await running;\n`);
+    const wrapper = spawn(process.execPath, [harness], { stdio: "ignore" });
+    assert.equal(await waitFor(async () => access(captured).then(() => true, () => false), 120), true);
+    assert.equal(await waitFor(async () => access(ready).then(() => true, () => false), 120), true);
+    child = JSON.parse(await readFile(captured, "utf8"));
+    wrapper.kill("SIGHUP");
+    const result = await new Promise((resolveResult, rejectResult) => {
+      wrapper.once("error", rejectResult);
+      wrapper.once("exit", (code, signal) => resolveResult({ code, signal }));
+    });
+    assert.deepEqual(result, { code: 1, signal: null });
+    for (const pid of [child.pid, child.grandchild_pid]) {
+      assert.equal(await waitFor(async () => {
+        try { process.kill(pid, 0); return false; } catch { return true; }
+      }, 120), true, `process ${pid} survived terminal loss`);
+    }
+    assert.equal(await access(child.control).then(() => true, () => false), false);
+  } finally {
+    if (child?.pid) {
+      try { process.kill(-child.pid, "SIGKILL"); } catch { /* already stopped */ }
+    }
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("disabled managed-client wrapper does not leak its parent Codex writer identity", async () => {

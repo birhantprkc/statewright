@@ -60,6 +60,14 @@ export function applyCompactResumeRequest(message, enabled = true, historyLimit 
   return { ...message, params };
 }
 
+export function applyThreadListCwd(message, cwd = null) {
+  if (message?.method !== "thread/list" || !cwd || message.params?.cwd != null) return message;
+  return {
+    ...message,
+    params: { ...(message.params ?? {}), cwd },
+  };
+}
+
 export function hydrateBoundedResumeTurns(message) {
   if (message?.result?.thread?.turns?.length || !Array.isArray(message?.result?.initialTurnsPage?.data)) return message;
   // Codex 0.144.x resumes from legacy `thread.turns` and does not render the
@@ -77,7 +85,7 @@ export function hydrateBoundedResumeTurns(message) {
 
 function forwardWhenOpen(socket, payload) {
   if (socket.readyState === WebSocket.OPEN) socket.send(payload);
-  else socket.once("open", () => socket.send(payload));
+  else if (socket.readyState === WebSocket.CONNECTING) socket.once("open", () => socket.send(payload));
 }
 
 export async function startCodexAppServerRouteProxy({
@@ -90,6 +98,9 @@ export async function startCodexAppServerRouteProxy({
   onProtocolError = async () => {},
   compactResume = true,
   resumeHistoryLimit = 4,
+  threadListCwd = null,
+  idleMs = 500,
+  onIdle = async () => {},
 }) {
   const healthServer = createServer((request, response) => {
     if (request.url === "/readyz" || request.url === "/healthz") {
@@ -101,8 +112,32 @@ export async function startCodexAppServerRouteProxy({
     response.end();
   });
   const server = new WebSocketServer({ server: healthServer });
-  const receipts = new Map();
-  const requestMethods = new Map();
+  let connectedClients = 0;
+  let everConnected = false;
+  let closing = false;
+  let idleTimer = null;
+  let idleGeneration = 0;
+  const activeConnections = new Set();
+  const idleEligible = () => !closing && everConnected && connectedClients === 0 && activeConnections.size === 0;
+  const cancelIdle = () => {
+    idleGeneration += 1;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = null;
+  };
+  const scheduleIdle = () => {
+    cancelIdle();
+    if (!idleEligible()) return;
+    const generation = idleGeneration;
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      if (generation !== idleGeneration || !idleEligible()) return;
+      Promise.resolve(onIdle()).catch((error) => onTransportError({
+        side: "resident_idle",
+        message: error instanceof Error ? error.message : String(error),
+      })).catch(() => {});
+    }, idleMs);
+    idleTimer.unref?.();
+  };
   const listening = new Promise((resolveListening, rejectListening) => {
     healthServer.once("listening", resolveListening);
     healthServer.once("error", rejectListening);
@@ -113,20 +148,55 @@ export async function startCodexAppServerRouteProxy({
   if (!address || typeof address === "string") throw new Error("Could not allocate a Statewright App Server route proxy port.");
 
   server.on("connection", (downstream) => {
+    const connection = Symbol("app-server-connection");
+    const activeThreads = new Map();
+    const pendingTurnStarts = new Map();
+    const receipts = new Map();
+    const requestMethods = new Map();
+    const syncActivity = () => {
+      if (activeThreads.size > 0) activeConnections.add(connection);
+      else activeConnections.delete(connection);
+    };
+    const addActivity = (threadId, reason) => {
+      if (!threadId) return;
+      const reasons = activeThreads.get(threadId) ?? new Set();
+      reasons.add(reason);
+      activeThreads.set(threadId, reasons);
+      syncActivity();
+      cancelIdle();
+    };
+    const removeActivity = (threadId, reason) => {
+      const reasons = activeThreads.get(threadId);
+      if (!reasons) return;
+      reasons.delete(reason);
+      if (reasons.size === 0) activeThreads.delete(threadId);
+      syncActivity();
+    };
+    everConnected = true;
+    connectedClients += 1;
+    cancelIdle();
     const upstream = new WebSocket(upstreamUrl);
     void onConnection({ upstreamUrl });
     downstream.on("message", async (raw) => {
       let payload = String(raw);
+      let provisionalTurn = null;
       try {
         let message = JSON.parse(payload);
         void onConnection({ direction: "native_to_upstream", method: message.method ?? null });
         if (message.id !== undefined && message.method) requestMethods.set(String(message.id), message.method);
+        message = applyThreadListCwd(message, threadListCwd);
         const compacted = compactResume && message.method === "thread/resume";
         message = applyCompactResumeRequest(message, compactResume, resumeHistoryLimit);
         payload = JSON.stringify(message);
         if (compacted) void onConnection({ direction: "native_to_upstream", method: `thread/resume [last ${resumeHistoryLimit} turns]` });
         if (message.method === "turn/start") {
-          const route = await takePendingRoute(String(message.params?.threadId ?? ""));
+          const threadId = String(message.params?.threadId ?? "");
+          const requestId = message.id === undefined ? null : String(message.id);
+          const reason = requestId === null ? Symbol("turn-start") : `turn-start:${requestId}`;
+          provisionalTurn = { requestId, reason, threadId };
+          addActivity(threadId, reason);
+          if (requestId !== null) pendingTurnStarts.set(requestId, provisionalTurn);
+          const route = await takePendingRoute(threadId);
           const applied = applyRouteToTurnStart(message, route);
           payload = JSON.stringify(applied.message);
           if (applied.receipt) {
@@ -135,6 +205,10 @@ export async function startCodexAppServerRouteProxy({
           }
         }
       } catch (error) {
+        if (provisionalTurn) {
+          removeActivity(provisionalTurn.threadId, provisionalTurn.reason);
+          if (provisionalTurn.requestId !== null) pendingTurnStarts.delete(provisionalTurn.requestId);
+        }
         void onProtocolError({ side: "native_to_upstream", message: error instanceof Error ? error.message : String(error) });
         downstream.close(1011, `Statewright route proxy failed: ${error.message}`);
         return;
@@ -145,12 +219,30 @@ export async function startCodexAppServerRouteProxy({
       let payload = String(raw);
       try {
         let notification = JSON.parse(payload);
-        const responseTo = notification.id !== undefined ? requestMethods.get(String(notification.id)) : null;
-        if (responseTo) requestMethods.delete(String(notification.id));
+        const responseId = notification.id === undefined ? null : String(notification.id);
+        const responseTo = responseId === null ? null : requestMethods.get(responseId);
+        if (responseTo) requestMethods.delete(responseId);
+        const pendingTurn = responseId === null ? null : pendingTurnStarts.get(responseId);
+        if (pendingTurn) {
+          pendingTurnStarts.delete(responseId);
+          if (notification.error) removeActivity(pendingTurn.threadId, pendingTurn.reason);
+        }
         if (responseTo === "thread/resume") {
           notification = hydrateBoundedResumeTurns(notification);
           payload = JSON.stringify(notification);
         }
+        const statusThreadId = String(notification?.params?.threadId ?? "");
+        if (notification?.method === "thread/status/changed" && statusThreadId) {
+          if (notification.params?.status?.type === "active") addActivity(statusThreadId, "server-active");
+          else activeThreads.delete(statusThreadId);
+        } else if (notification?.method === "turn/started" && statusThreadId) {
+          addActivity(statusThreadId, "server-active");
+        } else if (notification?.method === "turn/completed" && statusThreadId) {
+          activeThreads.delete(statusThreadId);
+        }
+        syncActivity();
+        if (downstreamClosed && activeThreads.size === 0 && upstream.readyState === WebSocket.OPEN) upstream.close();
+        scheduleIdle();
         void onConnection({
           direction: "upstream_to_native",
           method: notification.method ?? (responseTo ? `response:${responseTo}` : null),
@@ -177,17 +269,32 @@ export async function startCodexAppServerRouteProxy({
       if (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING) upstream.close();
       if (downstream.readyState === WebSocket.OPEN || downstream.readyState === WebSocket.CONNECTING) downstream.close();
     };
+    let downstreamClosed = false;
+    const markDownstreamClosed = () => {
+      if (!downstreamClosed) {
+        downstreamClosed = true;
+        connectedClients = Math.max(0, connectedClients - 1);
+      }
+    };
+    const preserveActiveOrClose = () => {
+      markDownstreamClosed();
+      if (closing || activeThreads.size === 0) closePeer();
+      else if (downstream.readyState === WebSocket.OPEN || downstream.readyState === WebSocket.CONNECTING) downstream.close();
+      scheduleIdle();
+    };
     downstream.on("close", (code, reason) => {
       void onTransportError({ side: "native_close", code, message: `${code} ${String(reason)}`.trim() });
-      closePeer();
+      preserveActiveOrClose();
     });
     downstream.on("error", (error) => {
       void onTransportError({ side: "native", message: error.message });
-      closePeer();
+      preserveActiveOrClose();
     });
     upstream.on("close", (code, reason) => {
+      activeConnections.delete(connection);
       void onTransportError({ side: "upstream_close", code, message: `${code} ${String(reason)}`.trim() });
       closePeer();
+      scheduleIdle();
     });
     upstream.on("error", (error) => {
       void onTransportError({ side: "upstream", message: error.message });
@@ -198,6 +305,8 @@ export async function startCodexAppServerRouteProxy({
   return {
     url: `ws://127.0.0.1:${address.port}`,
     async close() {
+      closing = true;
+      cancelIdle();
       for (const client of server.clients) client.terminate();
       await new Promise((resolveClose) => server.close(() => healthServer.close(() => resolveClose())));
     },

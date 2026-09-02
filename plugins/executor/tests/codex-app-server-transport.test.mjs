@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import test from "node:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
@@ -8,9 +9,10 @@ import {
   appServerHomePrefixForClient,
   codexAppServerTransportEnabled,
   routeConfigEdits,
+  startCodexAppServerRuntime,
 } from "../lib/codex-app-server-transport.mjs";
-import { nextCodexResidentRouteRequest, residentControlDir, residentMatchesRuntime, residentRoot, residentRuntimeRevision } from "../lib/codex-app-server-resident.mjs";
-import { applyCompactResumeRequest, applyRouteToTurnStart, hydrateBoundedResumeTurns, settingsConfirmRoute, startCodexAppServerRouteProxy } from "../lib/codex-app-server-route-proxy.mjs";
+import { ensureCodexAppServerResident, nextCodexResidentRouteRequest, residentControlDir, residentMatchesRuntime, residentRoot, residentRuntimeRevision } from "../lib/codex-app-server-resident.mjs";
+import { applyCompactResumeRequest, applyRouteToTurnStart, applyThreadListCwd, hydrateBoundedResumeTurns, settingsConfirmRoute, startCodexAppServerRouteProxy } from "../lib/codex-app-server-route-proxy.mjs";
 
 function once(socket, event) {
   return new Promise((resolveEvent) => socket.once(event, resolveEvent));
@@ -33,6 +35,32 @@ test("Codex App Server transport remains opt-in and supports an explicit environ
 test("App Server transport creates bounded, filesystem-safe temporary home names", () => {
   assert.equal(appServerHomePrefixForClient("swc_abc:unsafe/path"), "statewright-swc_abc-unsafe-path");
   assert.match(appServerHomePrefixForClient("x".repeat(100)), /^statewright-x{60}$/);
+});
+
+test("App Server runtime confirms its owned child exits before close completes", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-app-server-close-"));
+  const codexHome = join(home, ".codex");
+  const fake = join(home, "fake-codex.mjs");
+  const pidPath = join(home, "app-server.pid");
+  try {
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(fake, `#!/usr/bin/env node\nimport { createServer } from "node:http";\nimport { writeFileSync } from "node:fs";\nconst target = new URL(process.argv.at(-1));\nprocess.on("SIGTERM", () => {});\nwriteFileSync(${JSON.stringify(pidPath)}, String(process.pid));\ncreateServer((_request, response) => { response.writeHead(200); response.end("ok\\n"); }).listen(Number(target.port), target.hostname);\n`);
+    await chmod(fake, 0o755);
+    const runtime = await startCodexAppServerRuntime({
+      command: fake,
+      environment: { ...process.env, CODEX_HOME: codexHome, STATEWRIGHT_SENTRY_DISABLED: "true" },
+      cwd: home,
+      home,
+      clientId: "swc_shutdown_test",
+      shutdownGraceMs: 20,
+      reporter: { async report() {} },
+    });
+    const pid = Number(await readFile(pidPath, "utf8"));
+    await runtime.close();
+    assert.throws(() => process.kill(pid, 0));
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test("resident App Server state is stable per managed client and keeps routes outside the transient launcher", () => {
@@ -59,8 +87,37 @@ test("resident runtime revision changes reuse only when the loaded transport bun
   const revision = await residentRuntimeRevision();
   assert.match(revision, /^[a-f0-9]{16}$/);
   assert.equal(residentMatchesRuntime({ runtimeRevision: revision }, revision), true);
+  assert.equal(residentMatchesRuntime({ runtimeRevision: revision, threadListCwd: "/repo" }, revision, "/repo"), true);
+  assert.equal(residentMatchesRuntime({ runtimeRevision: revision, threadListCwd: "/repo" }, revision, null), false);
+  assert.equal(residentMatchesRuntime({ runtimeRevision: revision, threadListCwd: null }, revision, "/repo"), false);
   assert.equal(residentMatchesRuntime({ runtimeRevision: "stale" }, revision), false);
   assert.equal(residentMatchesRuntime({}, revision), false);
+});
+
+test("a mismatched launch never retires a live resident that may own detached work", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-resident-mismatch-"));
+  const clientId = "swc_scope_mismatch";
+  const root = residentRoot(home, clientId);
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  try {
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, "manifest.json"), JSON.stringify({
+      pid: child.pid,
+      proxyUrl: "ws://127.0.0.1:1",
+      runtimeRevision: await residentRuntimeRevision(),
+      threadListCwd: "/repo-a",
+    }));
+    await assert.rejects(
+      ensureCodexAppServerResident({ command: "codex", cwd: "/repo-b", home, clientId, threadListCwd: "/repo-b" }),
+      /may be preserving detached work/i,
+    );
+    assert.doesNotThrow(() => process.kill(child.pid, 0));
+  } finally {
+    const exited = once(child, "exit");
+    child.kill("SIGTERM");
+    await exited;
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test("App Server transport writes only next-turn model and effort config overrides", () => {
@@ -105,6 +162,207 @@ test("App Server routing overrides the native next turn and requires a settings 
   });
 });
 
+test("App Server resume history is scoped to the managed project unless the client supplied a cwd", () => {
+  assert.deepEqual(applyThreadListCwd({ id: 1, method: "thread/list", params: { limit: 20 } }, "/repo"), {
+    id: 1,
+    method: "thread/list",
+    params: { limit: 20, cwd: "/repo" },
+  });
+  assert.deepEqual(applyThreadListCwd({ id: 2, method: "thread/list", params: { cwd: ["/other"] } }, "/repo"), {
+    id: 2,
+    method: "thread/list",
+    params: { cwd: ["/other"] },
+  });
+  assert.deepEqual(applyThreadListCwd({ id: 3, method: "model/list", params: {} }, "/repo"), {
+    id: 3,
+    method: "model/list",
+    params: {},
+  });
+});
+
+test("resident proxy retires after its last idle TUI disconnects", async () => {
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(upstream, "listening");
+  const address = upstream.address();
+  let idleCalls = 0;
+  let resolveIdle;
+  const idle = new Promise((resolve) => { resolveIdle = resolve; });
+  const proxy = await startCodexAppServerRouteProxy({
+    upstreamUrl: `ws://127.0.0.1:${address.port}`,
+    takePendingRoute: async () => null,
+    idleMs: 10,
+    onIdle: async () => { idleCalls += 1; resolveIdle(); },
+  });
+  const client = new WebSocket(proxy.url);
+  await once(client, "open");
+  client.close();
+  await idle;
+  assert.equal(idleCalls, 1);
+  await proxy.close();
+  await new Promise((resolveClose) => upstream.close(resolveClose));
+});
+
+test("resident proxy preserves a detached active turn until it completes", async () => {
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(upstream, "listening");
+  const address = upstream.address();
+  let upstreamSocket;
+  const upstreamConnection = new Promise((resolveConnection) => upstream.once("connection", (socket) => {
+    upstreamSocket = socket;
+    resolveConnection();
+  }));
+  let idleCalls = 0;
+  let resolveIdle;
+  const idle = new Promise((resolve) => { resolveIdle = resolve; });
+  const proxy = await startCodexAppServerRouteProxy({
+    upstreamUrl: `ws://127.0.0.1:${address.port}`,
+    takePendingRoute: async () => null,
+    idleMs: 10,
+    onIdle: async () => { idleCalls += 1; resolveIdle(); },
+  });
+  const client = new WebSocket(proxy.url);
+  await once(client, "open");
+  await upstreamConnection;
+  const active = once(client, "message");
+  upstreamSocket.send(JSON.stringify({ method: "thread/status/changed", params: { threadId: "thread-1", status: { type: "active" } } }));
+  await active;
+  client.close();
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 30));
+  assert.equal(idleCalls, 0);
+  upstreamSocket.send(JSON.stringify({ method: "turn/completed", params: { threadId: "thread-1" } }));
+  await idle;
+  assert.equal(idleCalls, 1);
+  await proxy.close();
+  await new Promise((resolveClose) => upstream.close(resolveClose));
+});
+
+test("resident proxy preserves a submitted turn before its activity acknowledgement", async () => {
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(upstream, "listening");
+  const address = upstream.address();
+  let upstreamSocket;
+  const upstreamConnection = new Promise((resolveConnection) => upstream.once("connection", (socket) => {
+    upstreamSocket = socket;
+    resolveConnection();
+  }));
+  let idleCalls = 0;
+  let resolveIdle;
+  const idle = new Promise((resolve) => { resolveIdle = resolve; });
+  const proxy = await startCodexAppServerRouteProxy({
+    upstreamUrl: `ws://127.0.0.1:${address.port}`,
+    takePendingRoute: async () => null,
+    idleMs: 10,
+    onIdle: async () => { idleCalls += 1; resolveIdle(); },
+  });
+  const client = new WebSocket(proxy.url);
+  await once(client, "open");
+  await upstreamConnection;
+  const submitted = once(upstreamSocket, "message");
+  client.send(JSON.stringify({ id: 1, method: "turn/start", params: { threadId: "thread-1", input: [] } }));
+  await submitted;
+  client.terminate();
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 30));
+  assert.equal(idleCalls, 0);
+  assert.equal(upstreamSocket.readyState, WebSocket.OPEN);
+  upstreamSocket.send(JSON.stringify({ method: "turn/completed", params: { threadId: "thread-1" } }));
+  await idle;
+  assert.equal(idleCalls, 1);
+  await proxy.close();
+  await new Promise((resolveClose) => upstream.close(resolveClose));
+});
+
+test("resident proxy clears provisional activity when turn submission is rejected", async () => {
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(upstream, "listening");
+  const address = upstream.address();
+  let upstreamSocket;
+  const upstreamConnection = new Promise((resolveConnection) => upstream.once("connection", (socket) => {
+    upstreamSocket = socket;
+    resolveConnection();
+  }));
+  let resolveIdle;
+  const idle = new Promise((resolve) => { resolveIdle = resolve; });
+  const proxy = await startCodexAppServerRouteProxy({
+    upstreamUrl: `ws://127.0.0.1:${address.port}`,
+    takePendingRoute: async () => null,
+    idleMs: 10,
+    onIdle: async () => resolveIdle(),
+  });
+  const client = new WebSocket(proxy.url);
+  await once(client, "open");
+  await upstreamConnection;
+  const submitted = once(upstreamSocket, "message");
+  client.send(JSON.stringify({ id: 1, method: "turn/start", params: { threadId: "thread-1", input: [] } }));
+  await submitted;
+  const rejected = once(client, "message");
+  upstreamSocket.send(JSON.stringify({ id: 1, error: { code: -32600, message: "rejected" } }));
+  await rejected;
+  client.close();
+  await idle;
+  await proxy.close();
+  await new Promise((resolveClose) => upstream.close(resolveClose));
+});
+
+test("resident proxy cancels pending idle retirement when a TUI reconnects", async () => {
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(upstream, "listening");
+  const address = upstream.address();
+  let idleCalls = 0;
+  let resolveIdle;
+  const idle = new Promise((resolve) => { resolveIdle = resolve; });
+  const proxy = await startCodexAppServerRouteProxy({
+    upstreamUrl: `ws://127.0.0.1:${address.port}`,
+    takePendingRoute: async () => null,
+    idleMs: 30,
+    onIdle: async () => { idleCalls += 1; resolveIdle(); },
+  });
+  const first = new WebSocket(proxy.url);
+  await once(first, "open");
+  first.close();
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+  const second = new WebSocket(proxy.url);
+  await once(second, "open");
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 40));
+  assert.equal(idleCalls, 0);
+  second.close();
+  await idle;
+  assert.equal(idleCalls, 1);
+  await proxy.close();
+  await new Promise((resolveClose) => upstream.close(resolveClose));
+});
+
+test("resident proxy keeps JSON-RPC request correlation local to each TUI", async () => {
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(upstream, "listening");
+  const address = upstream.address();
+  const upstreamSockets = [];
+  upstream.on("connection", (socket) => upstreamSockets.push(socket));
+  const proxy = await startCodexAppServerRouteProxy({
+    upstreamUrl: `ws://127.0.0.1:${address.port}`,
+    takePendingRoute: async () => null,
+  });
+  const first = new WebSocket(proxy.url);
+  await once(first, "open");
+  while (upstreamSockets.length < 1) await new Promise((resolveDelay) => setTimeout(resolveDelay, 1));
+  const second = new WebSocket(proxy.url);
+  await once(second, "open");
+  while (upstreamSockets.length < 2) await new Promise((resolveDelay) => setTimeout(resolveDelay, 1));
+  const forwardedRequests = upstreamSockets.map((socket) => once(socket, "message"));
+  first.send(JSON.stringify({ id: 1, method: "thread/resume", params: { threadId: "thread-a" } }));
+  second.send(JSON.stringify({ id: 1, method: "thread/resume", params: { threadId: "thread-b" } }));
+  await Promise.all(forwardedRequests);
+  const firstResponse = once(first, "message");
+  const secondResponse = once(second, "message");
+  upstreamSockets[0].send(JSON.stringify({ id: 1, result: { thread: { id: "thread-a", turns: [] }, initialTurnsPage: { data: [{ id: "a" }] } } }));
+  upstreamSockets[1].send(JSON.stringify({ id: 1, result: { thread: { id: "thread-b", turns: [] }, initialTurnsPage: { data: [{ id: "b" }] } } }));
+  assert.deepEqual(JSON.parse(String(await firstResponse)).result.thread.turns, [{ id: "a" }]);
+  assert.deepEqual(JSON.parse(String(await secondResponse)).result.thread.turns, [{ id: "b" }]);
+  first.close();
+  second.close();
+  await proxy.close();
+  await new Promise((resolveClose) => upstream.close(resolveClose));
+});
+
 test("compact resume requests server-supported metadata and bounded recent history", () => {
   const request = { id: 4, method: "thread/resume", params: { threadId: "thread-1", initialTurnsPage: { limit: 200 } } };
   assert.deepEqual(applyCompactResumeRequest(request), {
@@ -147,6 +405,7 @@ test("App Server route proxy injects one pending route and records the server re
     },
     onRouteInjected: async (receipt) => injected.push(receipt),
     onRouteConfirmed: async (receipt) => confirmed.push(receipt),
+    threadListCwd: "/repo",
   });
   let upstreamSocket;
   const upstreamConnection = new Promise((resolveConnection) => upstream.once("connection", (socket) => {
@@ -158,6 +417,9 @@ test("App Server route proxy injects one pending route and records the server re
   await upstreamConnection;
   assert.equal((await fetch(`${proxy.url.replace("ws:", "http:")}/readyz`)).status, 200);
   assert.equal((await fetch(`${proxy.url.replace("ws:", "http:")}/healthz`)).status, 200);
+  const listForwarded = new Promise((resolveMessage) => upstreamSocket.once("message", (raw) => resolveMessage(JSON.parse(String(raw)))));
+  client.send(JSON.stringify({ id: -1, method: "thread/list", params: { limit: 20 } }));
+  assert.deepEqual(await listForwarded, { id: -1, method: "thread/list", params: { limit: 20, cwd: "/repo" } });
   const childForwarded = new Promise((resolveMessage) => upstreamSocket.once("message", (raw) => resolveMessage(JSON.parse(String(raw)))));
   client.send(JSON.stringify({ id: 0, method: "turn/start", params: { threadId: "child-thread", input: [] } }));
   const childRequest = await childForwarded;

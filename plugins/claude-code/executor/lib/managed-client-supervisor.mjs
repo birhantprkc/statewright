@@ -367,13 +367,21 @@ function forwardManagedTermination(child, exit, { command, platform = process.pl
   };
   const onSigint = () => forward("SIGINT");
   const onSigterm = () => forward("SIGTERM");
+  const onSighup = () => forward("SIGHUP");
   process.once("SIGINT", onSigint);
   process.once("SIGTERM", onSigterm);
+  if (!windowsPlatform(platform)) process.once("SIGHUP", onSighup);
   return async () => {
     process.off("SIGINT", onSigint);
     process.off("SIGTERM", onSigterm);
+    if (!windowsPlatform(platform)) process.off("SIGHUP", onSighup);
     await termination;
   };
+}
+
+export function codexAllSessionsRequested(args = []) {
+  const boundary = args.indexOf("--");
+  return args.slice(0, boundary < 0 ? args.length : boundary).includes("--all");
 }
 
 export function routeClaudeModel(model) {
@@ -514,7 +522,14 @@ export async function runManagedClient({ host, command, args, environment = proc
           await bindManagedClientIdentity({ host, sessionId: identity.sessionId, clientId: routedClientId, home });
         }
         await preflightCodexHistory(args);
-        const resident = await ensureCodexAppServerResident({ command, cwd, environment: isolatedEnvironment, home, clientId: routedClientId });
+        const resident = await ensureCodexAppServerResident({
+          command,
+          cwd,
+          environment: isolatedEnvironment,
+          home,
+          clientId: routedClientId,
+          threadListCwd: codexAllSessionsRequested(args) ? null : cwd,
+        });
         const residentRoutes = residentControlDir(home, routedClientId);
         await resetCodexRootSession(residentRoutes, { sessionId: codexRootSessionId, clientId: routedClientId });
         const residentArgs = [...args, "--remote", resident.proxyUrl];
@@ -530,11 +545,17 @@ export async function runManagedClient({ host, command, args, environment = proc
           },
           stdio: "inherit",
         });
-        const result = await waitForExit(tui);
-        if (!isExpectedExit(result)) await reporter.report(new Error("Native Codex connected to its resident App Server exited unexpectedly."), {
-          mechanism: "child_exit", host, operation: "resident_tui", exit_code: result.code ?? 1, signal: result.signal,
-        });
-        return result.code ?? 1;
+        const tuiExit = waitForExit(tui);
+        const stopForwarding = forwardManagedTermination(tui, tuiExit, { command });
+        try {
+          const result = await tuiExit;
+          if (!isExpectedExit(result)) await reporter.report(new Error("Native Codex connected to its resident App Server exited unexpectedly."), {
+            mechanism: "child_exit", host, operation: "resident_tui", exit_code: result.code ?? 1, signal: result.signal,
+          });
+          return result.code ?? 1;
+        } finally {
+          await stopForwarding();
+        }
       }
     }
     bridge = await createManagedMcpBridge({ environment, clientId: routedClientId, bridgeFactory });
@@ -564,7 +585,7 @@ export async function runManagedClient({ host, command, args, environment = proc
         stdio: "inherit",
         // POSIX process-group ownership lets cancellation terminate every
         // descendant the CLI starts. Scoped forwarding above prevents that
-        // detached group from outliving a one-shot supervisor.
+        // detached group from outliving its managed supervisor.
         detached: process.platform !== "win32",
         // Non-npm .cmd/.bat launchers still need cmd.exe. npm-generated shims
         // are resolved to their Node entrypoint above, preserving argv exactly.
@@ -574,64 +595,64 @@ export async function runManagedClient({ host, command, args, environment = proc
       let restart = false;
       child.once("exit", () => { exited = true; });
       const exit = waitForExit(child);
-      if (oneShotCodexExec) {
-        const stopForwarding = forwardManagedTermination(child, exit, { command: launchCommand });
-        try {
+      const stopForwarding = forwardManagedTermination(child, exit, { command: launchCommand });
+      try {
+        if (oneShotCodexExec) {
           const result = await exit;
           if (!isExpectedExit(result)) await reporter.report(new Error("Managed codex exec exited unexpectedly."), {
             mechanism: "child_exit", host, operation: "managed_exec", exit_code: result.code ?? 1, signal: result.signal,
           });
           return result.code ?? 1;
-        } finally {
-          await stopForwarding();
         }
-      }
-      while (!exited) {
-        const request = await nextRouteRequest(controlDir, consumed).catch(() => null);
-        if (request) {
-          if (request.client_id !== routedClientId) {
-            process.stderr.write("[statewright] rejected route request with a mismatched managed client identity.\n");
-            continue;
-          }
-          if (host === "claude") {
-            const declaredRoot = String(request.root_session_id ?? "").trim();
-            const requestSessionId = String(request.session_id ?? "").trim();
-            if (!claudeRootSessionId) claudeRootSessionId = declaredRoot || requestSessionId || null;
-            if (!requestSessionId || requestSessionId !== claudeRootSessionId) {
-              process.stderr.write("[statewright] deferred Claude model route from a native fork; the parent session remains authoritative.\n");
+        while (!exited) {
+          const request = await nextRouteRequest(controlDir, consumed).catch(() => null);
+          if (request) {
+            if (request.client_id !== routedClientId) {
+              process.stderr.write("[statewright] rejected route request with a mismatched managed client identity.\n");
               continue;
             }
-          }
-          if (host === "codex") {
-            const registration = await readCodexRootSession(controlDir, routedClientId);
-            if (!codexRouteOwnsRoot(request, registration)) {
-              process.stderr.write("[statewright] deferred Codex model route from a nested process; the parent thread remains authoritative.\n");
-              continue;
+            if (host === "claude") {
+              const declaredRoot = String(request.root_session_id ?? "").trim();
+              const requestSessionId = String(request.session_id ?? "").trim();
+              if (!claudeRootSessionId) claudeRootSessionId = declaredRoot || requestSessionId || null;
+              if (!requestSessionId || requestSessionId !== claudeRootSessionId) {
+                process.stderr.write("[statewright] deferred Claude model route from a native fork; the parent session remains authoritative.\n");
+                continue;
+              }
             }
-            codexRootSessionId = registration.sessionId;
+            if (host === "codex") {
+              const registration = await readCodexRootSession(controlDir, routedClientId);
+              if (!codexRouteOwnsRoot(request, registration)) {
+                process.stderr.write("[statewright] deferred Codex model route from a nested process; the parent thread remains authoritative.\n");
+                continue;
+              }
+              codexRootSessionId = registration.sessionId;
+            }
+            await bindManagedClientIdentity({
+              host,
+              sessionId: request.session_id,
+              clientId: routedClientId,
+              home,
+            });
+            // An omitted model is an inherited route. The initial unmanaged TUI
+            // model is authoritative, so there is no safe or useful restart.
+            if (!request.model) continue;
+            nextArgs = buildRoutedArgs({ host, originalArgs: args, request });
+            restart = true;
+            await restartManagedChild(child, exit, { command: launchCommand });
+            break;
           }
-          await bindManagedClientIdentity({
-            host,
-            sessionId: request.session_id,
-            clientId: routedClientId,
-            home,
+          await delay(pollMs);
+        }
+        const result = await exit;
+        if (!restart) {
+          if (!isExpectedExit(result)) await reporter.report(new Error(`Managed ${host} client exited unexpectedly.`), {
+            mechanism: "child_exit", host, operation: "managed_client", exit_code: result.code ?? 1, signal: result.signal,
           });
-          // An omitted model is an inherited route. The initial unmanaged TUI
-          // model is authoritative, so there is no safe or useful restart.
-          if (!request.model) continue;
-          nextArgs = buildRoutedArgs({ host, originalArgs: args, request });
-          restart = true;
-          await restartManagedChild(child, exit, { command: launchCommand });
-          break;
+          return result.code ?? 1;
         }
-        await delay(pollMs);
-      }
-      const result = await exit;
-      if (!restart) {
-        if (!isExpectedExit(result)) await reporter.report(new Error(`Managed ${host} client exited unexpectedly.`), {
-          mechanism: "child_exit", host, operation: "managed_client", exit_code: result.code ?? 1, signal: result.signal,
-        });
-        return result.code ?? 1;
+      } finally {
+        await stopForwarding();
       }
     }
   } finally {

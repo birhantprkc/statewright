@@ -12,6 +12,18 @@ function delay(milliseconds) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
+function childStopped(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+async function stopOwnedAppServer(child, closed, graceMs) {
+  if (!childStopped(child)) child.kill("SIGTERM");
+  if (await Promise.race([closed.then(() => true), delay(graceMs).then(() => false)])) return;
+  if (!childStopped(child)) child.kill("SIGKILL");
+  if (await Promise.race([closed.then(() => true), delay(graceMs).then(() => false)])) return;
+  throw new Error(`Statewright could not confirm that its owned Codex App Server process ${child.pid ?? "unknown"} stopped.`);
+}
+
 async function reserveLoopbackPort() {
   const server = createServer();
   await new Promise((resolveListen, rejectListen) => {
@@ -181,6 +193,10 @@ export async function startCodexAppServerRuntime({
   nextRouteRequest = async () => null,
   stderr = process.stderr,
   telemetry = async () => {},
+  threadListCwd = null,
+  idleMs = 500,
+  shutdownGraceMs = 1_500,
+  onIdle = async () => {},
   reporter = createErrorReporter({ plugin: "codex", version: "0.3.0", environment }),
 }) {
   const codexHome = environment.CODEX_HOME ?? join(home, ".codex");
@@ -193,6 +209,7 @@ export async function startCodexAppServerRuntime({
     env: { ...environment, CODEX_HOME: appServerHome },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const appServerClosed = new Promise((resolveClosed) => appServer.once("close", resolveClosed));
   appServer.stderr.on("data", (chunk) => stderr.write(chunk));
   appServer.stdout.resume();
   let closing = false;
@@ -211,6 +228,9 @@ export async function startCodexAppServerRuntime({
       upstreamUrl: url,
       compactResume: environment.STATEWRIGHT_CODEX_COMPACT_RESUME !== "false",
       resumeHistoryLimit: resumeHistoryLimit(environment),
+      threadListCwd,
+      idleMs,
+      onIdle,
       takePendingRoute: nextRouteRequest,
       onRouteInjected: async (receipt) => {
         await telemetry("app_server_route_injected", { client_id: clientId, ...receipt });
@@ -244,14 +264,16 @@ export async function startCodexAppServerRuntime({
       upstreamUrl: url,
       async close() {
         closing = true;
-        await routeProxy.close();
-        if (appServer.exitCode === null) appServer.kill("SIGTERM");
+        await routeProxy.close().catch(async (error) => {
+          await reporter.report(error, { mechanism: "shutdown", host: "codex", operation: "app_server_proxy" }).catch(() => {});
+        });
+        await stopOwnedAppServer(appServer, appServerClosed, shutdownGraceMs);
         await rm(appServerHome, { recursive: true, force: true });
       },
     };
   } catch (error) {
     closing = true;
-    if (appServer.exitCode === null) appServer.kill("SIGTERM");
+    await stopOwnedAppServer(appServer, appServerClosed, shutdownGraceMs);
     await rm(appServerHome, { recursive: true, force: true });
     throw error;
   }

@@ -46,28 +46,16 @@ export async function residentRuntimeRevision() {
   return createHash("sha256").update(sources.join("\n--- statewright resident module ---\n")).digest("hex").slice(0, 16);
 }
 
-export function residentMatchesRuntime(manifest, runtimeRevision) {
-  return manifest?.runtimeRevision === runtimeRevision;
+export function residentMatchesRuntime(manifest, runtimeRevision, threadListCwd = undefined) {
+  if (manifest?.runtimeRevision !== runtimeRevision) return false;
+  return threadListCwd === undefined || (manifest.threadListCwd ?? null) === threadListCwd;
 }
 
-async function ready(manifest, runtimeRevision) {
-  if (!residentMatchesRuntime(manifest, runtimeRevision) || !manifest?.pid || !processAlive(manifest.pid) || !manifest.proxyUrl) return false;
+async function ready(manifest, runtimeRevision, threadListCwd) {
+  if (!residentMatchesRuntime(manifest, runtimeRevision, threadListCwd) || !manifest?.pid || !processAlive(manifest.pid) || !manifest.proxyUrl) return false;
   try {
     return (await fetch(`${manifest.proxyUrl.replace(/^ws/, "http")}/readyz`, { signal: AbortSignal.timeout(400) })).ok;
   } catch { return false; }
-}
-
-async function retireResident(manifest, manifestPath) {
-  if (manifest?.pid && processAlive(manifest.pid)) {
-    process.kill(manifest.pid, "SIGTERM");
-    for (let attempt = 0; attempt < 40 && processAlive(manifest.pid); attempt += 1) {
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
-    }
-    if (processAlive(manifest.pid)) {
-      throw new Error(`Statewright Codex App Server resident ${manifest.pid} did not stop for a runtime update.`);
-    }
-  }
-  await unlink(manifestPath).catch(() => {});
 }
 
 async function writeManifest(path, value) {
@@ -113,18 +101,29 @@ async function createManagedMcpBridge({ environment, clientId }) {
   return bridge;
 }
 
-export async function ensureCodexAppServerResident({ command, cwd, environment = process.env, home = homedir(), clientId }) {
+export async function ensureCodexAppServerResident({ command, cwd, environment = process.env, home = homedir(), clientId, threadListCwd = null }) {
   const root = residentRoot(home, clientId);
   const manifestPath = join(root, "manifest.json");
   const runtimeRevision = await residentRuntimeRevision();
   const existing = await readManifest(manifestPath);
-  if (await ready(existing, runtimeRevision)) return existing;
+  if (await ready(existing, runtimeRevision, threadListCwd)) return existing;
   if (existing?.pid && processAlive(existing.pid)) {
-    await retireResident(existing, manifestPath);
+    throw new Error(
+      `Statewright Codex App Server resident ${existing.pid} is still running with a different runtime or resume scope. `
+      + "It may be preserving detached work; exit it or wait for it to become idle, then retry.",
+    );
   }
+  await unlink(manifestPath).catch(() => {});
   await mkdir(root, { recursive: true, mode: 0o700 });
   const logHandle = await open(join(root, "resident.log"), "a", 0o600);
-  const child = spawn(process.execPath, [RESIDENT_ENTRYPOINT, "--client-id", clientId, "--command", command, "--cwd", cwd, "--home", home], {
+  const child = spawn(process.execPath, [
+    RESIDENT_ENTRYPOINT,
+    "--client-id", clientId,
+    "--command", command,
+    "--cwd", cwd,
+    "--home", home,
+    "--thread-list-cwd", threadListCwd ?? "",
+  ], {
     cwd,
     env: { ...environment, STATEWRIGHT_CODEX_RESIDENT_ROOT: root },
     detached: true,
@@ -134,7 +133,7 @@ export async function ensureCodexAppServerResident({ command, cwd, environment =
   child.unref();
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const manifest = await readManifest(manifestPath);
-    if (await ready(manifest, runtimeRevision)) return manifest;
+    if (await ready(manifest, runtimeRevision, threadListCwd)) return manifest;
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
   }
   const log = await readFile(join(root, "resident.log"), "utf8").catch(() => "");
@@ -147,6 +146,7 @@ async function main() {
   const command = values.command;
   const cwd = values.cwd;
   const home = values.home ?? homedir();
+  const threadListCwd = values["thread-list-cwd"] || null;
   const reporter = createErrorReporter({ plugin: "codex", version: "0.3.0" });
   reporter.installProcessHandlers();
   if (!clientId || !command || !cwd) throw new Error("resident requires client-id, command, and cwd");
@@ -156,7 +156,17 @@ async function main() {
   await mkdir(controlDir, { recursive: true, mode: 0o700 });
   await writeManagedControlIdentity(controlDir, { host: "codex", clientId });
   const bridge = await createManagedMcpBridge({ environment: process.env, clientId });
-  const runtime = await startCodexAppServerRuntime({
+  let runtime = null;
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    await runtime?.close();
+    await bridge.close();
+    await unlink(manifestPath).catch(() => {});
+    process.exit(0);
+  };
+  runtime = await startCodexAppServerRuntime({
     command,
     cwd,
     home,
@@ -170,6 +180,8 @@ async function main() {
       STATEWRIGHT_MANAGED_MCP_TOKEN: bridge.token,
     },
     nextRouteRequest: (threadId) => nextCodexResidentRouteRequest(controlDir, clientId, threadId),
+    threadListCwd,
+    onIdle: stop,
     telemetry: telemetryWriter(process.env),
     reporter,
   });
@@ -179,14 +191,9 @@ async function main() {
     clientId,
     proxyUrl: runtime.proxyUrl,
     runtimeRevision: await residentRuntimeRevision(),
+    threadListCwd,
     startedAt: new Date().toISOString(),
   });
-  const stop = async () => {
-    await runtime.close();
-    await bridge.close();
-    await unlink(manifestPath).catch(() => {});
-    process.exit(0);
-  };
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
 }
