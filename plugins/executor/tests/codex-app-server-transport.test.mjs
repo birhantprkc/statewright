@@ -12,7 +12,7 @@ import {
   startCodexAppServerRuntime,
 } from "../lib/codex-app-server-transport.mjs";
 import { ensureCodexAppServerResident, nextCodexResidentRouteRequest, residentControlDir, residentMatchesRuntime, residentRoot, residentRuntimeRevision } from "../lib/codex-app-server-resident.mjs";
-import { applyCompactResumeRequest, applyRouteToTurnStart, applyThreadListCwd, hydrateBoundedResumeTurns, settingsConfirmRoute, startCodexAppServerRouteProxy } from "../lib/codex-app-server-route-proxy.mjs";
+import { applyCompactResumeRequest, applyRouteToTurnStart, applyThreadListCwd, clarifyActiveWriterResumeError, hydrateBoundedResumeTurns, settingsConfirmRoute, startCodexAppServerRouteProxy } from "../lib/codex-app-server-route-proxy.mjs";
 
 function once(socket, event) {
   return new Promise((resolveEvent) => socket.once(event, resolveEvent));
@@ -388,6 +388,26 @@ test("bounded resume pages are normalized for the native Codex transcript surfac
   assert.equal(hydrateBoundedResumeTurns({ result: { thread: { turns: [{ id: "existing" }] } } }).result.thread.turns[0].id, "existing");
 });
 
+test("active-writer resume errors preserve the native refusal and explain when to retry", () => {
+  const response = {
+    id: 4,
+    error: {
+      code: -32600,
+      message: "thread thread-1 already has an active writer",
+      data: { threadId: "thread-1" },
+    },
+  };
+  const clarified = clarifyActiveWriterResumeError(response);
+  assert.equal(clarified.error.code, -32600);
+  assert.deepEqual(clarified.error.data, { threadId: "thread-1" });
+  assert.match(clarified.error.message, /^thread thread-1 already has an active writer\b/);
+  assert.match(clarified.error.message, /wait a minute or two for the current turn to finish, then try again/i);
+  assert.match(clarified.error.message, /if it still fails, close the other Codex client or recover the stale managed session/i);
+  assert.equal(clarifyActiveWriterResumeError(clarified), clarified);
+  const unrelated = { id: 5, error: { code: -32600, message: "thread not found" } };
+  assert.equal(clarifyActiveWriterResumeError(unrelated), unrelated);
+});
+
 test("App Server route proxy injects one pending route and records the server receipt", async () => {
   const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await once(upstream, "listening");
@@ -457,6 +477,21 @@ test("App Server route proxy injects one pending route and records the server re
     message: { id: 2, result: { thread: { id: "thread-proxy", turns: [{ id: "older" }, { id: "newest" }] }, initialTurnsPage: { data: [{ id: "newest" }, { id: "older" }] } } },
     isBinary: false,
   });
+  const rejectedResumeForwarded = new Promise((resolveMessage) => upstreamSocket.once("message", (raw) => resolveMessage(JSON.parse(String(raw)))));
+  client.send(JSON.stringify({ id: 3, method: "thread/resume", params: { threadId: "thread-proxy" } }));
+  assert.equal((await rejectedResumeForwarded).method, "thread/resume");
+  const rejectedResumeResponse = new Promise((resolveMessage) => client.once("message", (raw) => resolveMessage(JSON.parse(String(raw)))));
+  upstreamSocket.send(JSON.stringify({ id: 3, error: { code: -32600, message: "thread thread-proxy already has an active writer" } }));
+  const rejected = await rejectedResumeResponse;
+  assert.equal(rejected.error.code, -32600);
+  assert.match(rejected.error.message, /wait a minute or two for the current turn to finish, then try again/i);
+  const nonResumeForwarded = new Promise((resolveMessage) => upstreamSocket.once("message", (raw) => resolveMessage(JSON.parse(String(raw)))));
+  client.send(JSON.stringify({ id: 4, method: "thread/read", params: { threadId: "thread-proxy" } }));
+  assert.equal((await nonResumeForwarded).method, "thread/read");
+  const nonResumeResponse = new Promise((resolveMessage) => client.once("message", (raw) => resolveMessage(JSON.parse(String(raw)))));
+  const nativeNonResumeError = { id: 4, error: { code: -32600, message: "thread thread-proxy already has an active writer" } };
+  upstreamSocket.send(JSON.stringify(nativeNonResumeError));
+  assert.deepEqual(await nonResumeResponse, nativeNonResumeError);
   client.close();
   await proxy.close();
   await new Promise((resolveClose) => upstream.close(resolveClose));

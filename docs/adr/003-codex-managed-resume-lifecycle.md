@@ -46,6 +46,10 @@ managed process and transport lifecycle:
 - A live resident is never replaced merely because a new invocation requests a
   different runtime revision or picker scope. Statewright refuses that launch
   until the resident retires, because it may be preserving detached work.
+- A native `thread/resume` active-writer refusal remains a refusal with its
+  original error code and diagnostic. The managed proxy adds guidance to wait a
+  minute or two for a background turn to finish and retry, followed by explicit
+  recovery guidance if another client or stale resident continues to own it.
 - Retirement keeps the manifest and temporary App Server home until the owned
   App Server has actually closed. Shutdown uses a bounded `SIGTERM` grace and
   escalates only that directly spawned child if it does not exit.
@@ -67,6 +71,8 @@ inspect or rewrite prompt text, titles, rollout contents, or session metadata.
   from its Statewright supervisor.
 - An idle resident releases the writer promptly, while an active detached turn
   is allowed to finish first.
+- A user who retries before detached work finishes receives an actionable wait
+  message instead of an unexplained writer-ownership error.
 - The default managed resume picker returns to project-local results. Users who
   intentionally choose `--all` retain Codex's native cross-project view and
   directory display.
@@ -78,14 +84,16 @@ inspect or rewrite prompt text, titles, rollout contents, or session metadata.
 
 - The original Auldwyrm and Nomad resume failures were traced to live Codex
   writer processes with no controlling terminal, rather than a false lock.
-- Focused supervisor and App Server lifecycle tests passed 48/48. The complete
-  executor suite passed 95/95 with inherited `CODEX_HOME` and
+- The affected App Server transport file passed 20/20. The complete executor
+  suite passed 97/97 with inherited `CODEX_HOME` and
   `CODEX_SQLITE_HOME` cleared so its temporary storage fixtures were
   authoritative.
 - Generated Claude runtime parity and `git diff --check` passed.
 - Three fresh read-only reviews rejected earlier cuts for lifecycle races. Each
   finding received a regression test and repair. A fourth fresh review approved
-  the final cut with no material findings.
+  the original lifecycle cut. A later independent review of the active-writer
+  guidance found no material implementation issue; its provenance and negative-
+  path coverage findings were repaired and revalidated.
 - Protocol and picker behavior were checked against the official
   [Codex CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli)
   and [Codex App Server reference](https://learn.chatgpt.com/docs/app-server).

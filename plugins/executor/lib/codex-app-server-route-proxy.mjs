@@ -83,6 +83,21 @@ export function hydrateBoundedResumeTurns(message) {
   };
 }
 
+const ACTIVE_WRITER_RETRY_GUIDANCE = "Another Codex process still owns this session. Wait a minute or two for the current turn to finish, then try again. If it still fails, close the other Codex client or recover the stale managed session before retrying.";
+
+export function clarifyActiveWriterResumeError(message) {
+  const original = message?.error?.message;
+  if (typeof original !== "string" || !/already has an active writer/i.test(original)) return message;
+  if (original.includes(ACTIVE_WRITER_RETRY_GUIDANCE)) return message;
+  return {
+    ...message,
+    error: {
+      ...message.error,
+      message: `${original} ${ACTIVE_WRITER_RETRY_GUIDANCE}`,
+    },
+  };
+}
+
 function forwardWhenOpen(socket, payload) {
   if (socket.readyState === WebSocket.OPEN) socket.send(payload);
   else if (socket.readyState === WebSocket.CONNECTING) socket.once("open", () => socket.send(payload));
@@ -228,6 +243,7 @@ export async function startCodexAppServerRouteProxy({
           if (notification.error) removeActivity(pendingTurn.threadId, pendingTurn.reason);
         }
         if (responseTo === "thread/resume") {
+          notification = clarifyActiveWriterResumeError(notification);
           notification = hydrateBoundedResumeTurns(notification);
           payload = JSON.stringify(notification);
         }
