@@ -1,0 +1,13 @@
+version: '3'
+
+vars:
+  HOST: '{{default "127.0.0.1" .HOST}}'
+  PORT: '{{default "4321" .PORT}}'
+
+tasks:
+  present:
+    desc: Serve the Reveal.js workshop deck locally
+    dir: '{{.TASKFILE_DIR}}'
+    cmds:
+      - echo "Workshop deck → http://{{.HOST}}:{{.PORT}}/"
+      - python3 -m http.server {{.PORT}} --bind {{.HOST}}

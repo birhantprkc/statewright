@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AI as a Management Operating System</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reveal.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/theme/night.css">
+    <style>
+      :root {
+        --r-background-color: #0d1118;
+        --r-main-color: #e9e6df;
+        --r-heading-color: #f7f3ec;
+        --r-link-color: #c78d5b;
+        --r-selection-background-color: #c78d5b;
+      }
+
+      .reveal {
+        color: var(--r-main-color);
+        font-family: "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
+        font-size: 34px;
+        font-weight: 400;
+        letter-spacing: -.012em;
+      }
+
+      .reveal h1,
+      .reveal h2,
+      .reveal h3 {
+        color: var(--r-heading-color);
+        font-family: "Iowan Old Style", "Baskerville", "Times New Roman", serif;
+        font-weight: 400;
+        letter-spacing: -.035em;
+        line-height: 1.07;
+        text-shadow: none;
+        text-transform: none;
+      }
+
+      .reveal h1 { font-size: 1.46em; }
+      .reveal h2 { font-size: 1.22em; }
+      .reveal h3 { font-size: .88em; }
+      .reveal strong { color: #d9a16e; font-weight: 600; }
+      .reveal em { color: #d8d1c6; }
+      .reveal ul, .reveal ol { margin-top: .72em; }
+      .reveal li { margin: .25em 0; }
+
+      .reveal table {
+        font-size: .66em;
+        margin-top: 1em;
+      }
+
+      .reveal td,
+      .reveal th {
+        border-color: rgba(233, 230, 223, .2);
+      }
+
+      .reveal th {
+        color: #d9a16e;
+        font-weight: 600;
+      }
+
+      .reveal blockquote {
+        width: 84%;
+        border-left: 2px solid #c78d5b;
+        box-shadow: none;
+        text-align: left;
+      }
+
+      .reveal code {
+        color: #f1d1ac;
+        font-size: .78em;
+      }
+
+      .reveal .slide-number {
+        color: #bdb5a9;
+        font-family: "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
+      }
+
+      .reveal .progress { color: #c78d5b; }
+
+      .reveal .about-slide,
+      .reveal .qa-slide {
+        align-items: center;
+        display: flex;
+        gap: 1.2em;
+        margin: auto;
+        max-width: 1080px;
+        text-align: left;
+      }
+
+      .reveal .about-portrait {
+        border: 1px solid rgba(233, 230, 223, .28);
+        height: 330px;
+        object-fit: cover;
+        object-position: center;
+        width: 250px;
+      }
+
+      .reveal .about-copy { flex: 1; }
+      .reveal .about-copy h2 { font-size: 1.2em; margin-bottom: .34em; }
+      .reveal .about-copy > p:first-of-type { color: #d9a16e; margin-top: 0; }
+      .reveal .about-line { font-size: .78em; line-height: 1.36; }
+
+      .reveal .about-connect,
+      .reveal .qa-connect {
+        color: #d9a16e;
+        font-size: .54em;
+        text-align: center;
+      }
+
+      .reveal .about-connect img,
+      .reveal .qa-connect img {
+        background: #fff;
+        height: 165px;
+        image-rendering: auto;
+        padding: 12px;
+        width: 165px;
+      }
+
+      .reveal .indy-slide {
+        align-items: center;
+        display: grid;
+        gap: .5em 1.2em;
+        grid-template-columns: 1.15fr 1.35fr .95fr;
+        margin: auto;
+        max-width: 1100px;
+        text-align: left;
+      }
+
+      .reveal .indy-logo {
+        filter: invert(1);
+        grid-column: 1 / -1;
+        height: auto;
+        margin: 0 0 .25em;
+        max-width: 440px;
+        width: 100%;
+      }
+
+      .reveal .indy-copy { grid-column: 1 / 3; }
+      .reveal .indy-copy h2 { font-size: 1.18em; line-height: 1.04; margin-bottom: .38em; }
+      .reveal .indy-copy p { font-size: .73em; line-height: 1.35; margin-bottom: 0; }
+      .reveal .indy-copy .indy-role { color: #d9a16e; font-size: .65em; margin-top: 0; }
+
+      .reveal .indy-stats {
+        border-left: 1px solid rgba(217, 161, 110, .7);
+        display: grid;
+        gap: .42em;
+        grid-column: 3;
+        padding-left: 1em;
+      }
+
+      .reveal .indy-stats div { display: grid; gap: .02em; }
+      .reveal .indy-stats strong { color: #d9a16e; font-size: .95em; font-weight: 600; }
+      .reveal .indy-stats span { color: #f7f3ec; font-size: .47em; }
+
+      .reveal .build-flow {
+        font-family: "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
+        margin: .65em auto 0;
+        max-width: 1040px;
+      }
+
+      .reveal .build-node {
+        border: 1px solid #c78d5b;
+        color: #f7f3ec;
+        display: inline-block;
+        font-size: .78em;
+        letter-spacing: 0;
+        padding: .42em 1.55em;
+      }
+
+      .reveal .build-brief { background: #18212c; }
+      .reveal .build-slice { background: #263040; }
+
+      .reveal .flow-arrow {
+        color: #d9a16e;
+        font-size: .95em;
+        line-height: .92;
+        margin: .12em 0;
+      }
+
+      .reveal .build-streams {
+        display: grid;
+        gap: 1px;
+        grid-template-columns: repeat(4, 1fr);
+        margin: 0 auto;
+        max-width: 1000px;
+      }
+
+      .reveal .build-streams div {
+        background: #18212c;
+        border: 1px solid rgba(199, 141, 91, .55);
+        color: #e9e6df;
+        font-size: .58em;
+        letter-spacing: 0;
+        padding: .68em .3em;
+      }
+
+      .reveal .agent-loop { margin: .8em auto 0; max-width: 1120px; }
+
+      .reveal .agent-loop-main {
+        align-items: center;
+        display: flex;
+        justify-content: center;
+      }
+
+      .reveal .agent-step {
+        background: #18212c;
+        border: 1px solid rgba(199, 141, 91, .72);
+        color: #f7f3ec;
+        font-family: "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
+        font-size: .53em;
+        letter-spacing: 0;
+        min-width: 120px;
+        padding: .58em .7em;
+      }
+
+      .reveal .agent-accept { background: #263040; min-width: 74px; }
+      .reveal .agent-arrow { color: #d9a16e; font-size: .82em; margin: 0 .3em; }
+      .reveal .agent-return {
+        align-items: center;
+        color: #d8d1c6;
+        display: grid;
+        font-family: "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
+        font-size: .43em;
+        gap: .55em;
+        grid-template-columns: 1fr auto 1fr;
+        margin: .38em auto 0;
+        max-width: 770px;
+        transform: translateX(18px);
+      }
+
+      .reveal .agent-return span { color: #d8d1c6; white-space: nowrap; }
+      .reveal .return-to-change { color: #d9a16e !important; font-size: 1.7em; line-height: .75; text-align: right; }
+      .reveal .return-from-inspect { color: #d9a16e !important; font-size: 1.7em; line-height: .75; text-align: left; }
+      .reveal .agent-return .agent-revise {
+        background: #263040;
+        font-size: 1.23em;
+        min-width: 120px;
+        padding: .58em .7em;
+      }
+
+      .reveal .qa-slide { justify-content: space-between; max-width: 900px; }
+      .reveal .qa-slide h2 { font-size: 1.48em; }
+      .reveal .qa-prompt { color: #d8d1c6; font-size: .7em; line-height: 1.4; max-width: 630px; }
+    </style>
+  </head>
+  <body>
+    <div class="reveal">
+      <div class="slides">
+        <section
+          data-markdown="slides.md"
+          data-separator="^---$"
+          data-separator-vertical="^----$"
+          data-separator-notes="^Notes:">
+        </section>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reveal.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/plugin/markdown/markdown.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/plugin/notes/notes.js"></script>
+    <script>
+      Reveal.initialize({
+        hash: true,
+        slideNumber: 'c/t',
+        transition: 'fade',
+        transitionSpeed: 'fast',
+        backgroundTransition: 'fade',
+        controls: true,
+        progress: true,
+        center: true,
+        plugins: [RevealMarkdown, RevealNotes]
+      });
+
+      Reveal.on('ready', () => {
+        for (const slide of Reveal.getSlides()) {
+          if (!slide.hasAttribute('data-background-image')) {
+            slide.setAttribute('data-background-image', 'assets/keynote-stage-background.png');
+            slide.setAttribute('data-background-size', 'cover');
+            slide.setAttribute('data-background-position', 'center');
+          }
+        }
+        Reveal.sync();
+      });
+
+    </script>
+  </body>
+</html>
