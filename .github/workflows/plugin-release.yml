@@ -7,6 +7,7 @@ on:
       - "claude-v*"
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
@@ -14,6 +15,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve release source commit
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Require exact-commit hosted canaries
+        uses: actions/github-script@v7
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        with:
+          script: |
+            const { requirePluginCanaries } = require("./.github/scripts/require-plugin-canaries.cjs")
+            await requirePluginCanaries({
+              github,
+              context,
+              core,
+              sourceSha: process.env.SOURCE_SHA,
+            })
       - name: Resolve plugin
         id: plugin
         env:
@@ -23,12 +40,18 @@ jobs:
             codex-v*)
               echo 'directory=plugins/codex' >> "$GITHUB_OUTPUT"
               echo 'artifact=statewright-codex' >> "$GITHUB_OUTPUT"
-              raw=${TAG#codex-v}; echo "version=${raw%%-r*}" >> "$GITHUB_OUTPUT"
+              raw=${TAG#codex-v}; version=${raw%%-r*}
+              echo "version=$version" >> "$GITHUB_OUTPUT"
+              echo "release_name=Statewright Codex plugin $version" >> "$GITHUB_OUTPUT"
+              echo "notes_path=docs/releases/$version.md" >> "$GITHUB_OUTPUT"
               ;;
             claude-v*)
               echo 'directory=plugins/claude-code' >> "$GITHUB_OUTPUT"
               echo 'artifact=statewright-claude-code' >> "$GITHUB_OUTPUT"
-              raw=${TAG#claude-v}; echo "version=${raw%%-r*}" >> "$GITHUB_OUTPUT"
+              raw=${TAG#claude-v}; version=${raw%%-r*}
+              echo "version=$version" >> "$GITHUB_OUTPUT"
+              echo "release_name=Statewright Claude Code plugin $version" >> "$GITHUB_OUTPUT"
+              echo "notes_path=docs/releases/$version.md" >> "$GITHUB_OUTPUT"
               ;;
             *) exit 1 ;;
           esac
@@ -43,6 +66,7 @@ jobs:
             actual=$(node -p "require('./$DIRECTORY/plugin.json').version")
           fi
           test "$actual" = "$EXPECTED"
+          test -f "${{ steps.plugin.outputs.notes_path }}"
       - name: Install plugin dependencies
         if: steps.plugin.outputs.directory == 'plugins/codex'
         run: npm ci --ignore-scripts --prefix plugins/codex
@@ -55,6 +79,7 @@ jobs:
           DIRECTORY: ${{ steps.plugin.outputs.directory }}
         run: |
           node --test plugins/executor/tests/license-metadata.test.mjs
+          node --test plugins/executor/tests/plugin-release-workflow.test.mjs
           if [ "$DIRECTORY" = "plugins/codex" ]; then
             node --test plugins/codex/tests/*.test.mjs
             bash -n plugins/codex/hook.sh plugins/codex/client-id.sh plugins/codex/mcp-proxy.sh
@@ -73,6 +98,6 @@ jobs:
       - name: Publish plugin release
         uses: softprops/action-gh-release@v2
         with:
-          name: "${{ steps.plugin.outputs.artifact }} ${{ github.ref_name }}"
-          generate_release_notes: true
+          name: "${{ steps.plugin.outputs.release_name }}"
+          body_path: "${{ steps.plugin.outputs.notes_path }}"
           files: "${{ steps.plugin.outputs.artifact }}-${{ steps.plugin.outputs.version }}.zip"
