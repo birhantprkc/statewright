@@ -455,6 +455,45 @@ async function gwCall(
   }
 }
 
+// A narrow transport seam used by the cross-platform production canary. It
+// does not mutate workflow state and shares OMX's normal direct MCP client.
+export async function callStatewrightGateway(
+  gwUrl: string,
+  apiKey: string,
+  toolName: string,
+  args: Record<string, unknown> = {},
+): Promise<GatewayState | null> {
+  return gwCall(gwUrl, apiKey, toolName, args)
+}
+
+export async function initializeStatewrightGateway(
+  gwUrl: string,
+  apiKey: string,
+): Promise<boolean> {
+  try {
+    const resp = await fetch(`${gwUrl}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 0,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "statewright-omx", version: "0.3.0" },
+        },
+      }),
+      signal: AbortSignal.timeout(8_000),
+    })
+    if (!resp.ok) return false
+    const body = await resp.json() as { error?: unknown }
+    return !body.error
+  } catch {
+    return false
+  }
+}
+
 async function adapterCall<T>(
   opts: HandlerOpts,
   endpoint: "state" | "pre-tool" | "post-tool" | "stop",

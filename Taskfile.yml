@@ -30,6 +30,42 @@ tasks:
       - node plugins/claude-code/scripts/sync-runtime.mjs --sync
       - node plugins/claude-code/scripts/sync-runtime.mjs --check
 
+  test:plugin-release:
+    desc: "Run the complete local validation gate for a Codex/Claude plugin release"
+    cmds:
+      - node plugins/executor/scripts/sync-error-reporting.mjs --check
+      - node plugins/codex/scripts/sync-executor-core.mjs --check
+      - node plugins/claude-code/scripts/sync-managed-client.mjs --check
+      - node --check plugins/executor/tests/unix-plugin-live-gateway-canary.mjs
+      - node --check plugins/executor/tests/windows-managed-client-live-gateway-canary.mjs
+      - node --test plugins/executor/tests/*.test.mjs
+      - node --test plugins/codex/tests/*.test.mjs
+      - node --test plugins/claude-code/tests/*.test.mjs
+      - npm test --prefix plugins/pi
+      - npm test --prefix plugins/opencode
+      - npm test --prefix plugins/omx
+      - bash -n plugins/codex/hook.sh plugins/codex/client-id.sh plugins/codex/mcp-proxy.sh
+      - bash -n plugins/claude-code/hook.sh plugins/claude-code/client-id.sh plugins/claude-code/mcp-proxy.sh plugins/claude-code/setup.sh
+      - git diff --check
+
+  test:plugin-production-canary:unix:
+    desc: "Exercise every Unix plugin transport against the production gateway without mutating workflow state"
+    preconditions:
+      - sh: '[ -n "${STATEWRIGHT_API_KEY:-}" ]'
+        msg: "STATEWRIGHT_API_KEY must contain the isolated production canary credential"
+      - sh: '[ -n "${STATEWRIGHT_GATEWAY_URL:-}" ]'
+        msg: "STATEWRIGHT_GATEWAY_URL must identify the production MCP gateway"
+    env:
+      STATEWRIGHT_PLUGIN_PRODUCTION_CANARY: "1"
+      STATEWRIGHT_NO_UPDATE_CHECK: "1"
+    cmds:
+      - node plugins/executor/tests/unix-plugin-live-gateway-canary.mjs codex
+      - node plugins/executor/tests/unix-plugin-live-gateway-canary.mjs claude
+      - node plugins/executor/tests/unix-plugin-live-gateway-canary.mjs cursor
+      - npm test --prefix plugins/pi -- --run src/production-gateway-canary.test.ts
+      - npm test --prefix plugins/opencode -- --run src/production-gateway-canary.test.ts
+      - npm test --prefix plugins/omx -- --run src/production-gateway-canary.test.ts
+
   test:claude-routing:
     desc: "Run Claude managed-proxy and loopback bridge routing tests"
     cmds:

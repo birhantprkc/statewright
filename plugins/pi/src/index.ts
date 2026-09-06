@@ -301,6 +301,15 @@ async function gwCall(
   return null
 }
 
+// Kept as a narrow exported transport seam so CI can exercise Pi's actual
+// authenticated gateway path without constructing a full interactive host.
+export async function callStatewrightGateway(
+  toolName: string,
+  args: Record<string, unknown> = {},
+): Promise<Record<string, unknown> | null> {
+  return gwCall(toolName, args)
+}
+
 async function gwInit(): Promise<boolean> {
   if (process.env.STATEWRIGHT_ADAPTER_URL) {
     try {
@@ -347,6 +356,10 @@ async function gwInit(): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+export async function initializeStatewrightGateway(): Promise<boolean> {
+  return gwInit()
 }
 
 async function adapterCall(
