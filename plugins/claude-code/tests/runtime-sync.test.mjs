@@ -17,7 +17,7 @@ async function copyRuntime(sourceRoot, targetRoot) {
 test("runtime sync discovers the installed cache and local directory marketplace", async () => {
   const root = await mkdtemp(join(tmpdir(), "statewright-claude-runtime-"));
   const home = join(root, "home");
-  const cache = join(home, ".claude/plugins/cache/statewright/statewright/0.3.0");
+  const cache = join(home, ".claude/plugins/cache/statewright/statewright/0.3.1");
   const marketplace = join(root, "marketplace");
   const directoryPlugin = join(marketplace, "plugins/statewright");
   try {

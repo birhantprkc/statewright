@@ -88,7 +88,7 @@ function createErrorReporter({
 } = {}) {
   const dsn = environment.STATEWRIGHT_SENTRY_DSN ?? DEFAULT_SENTRY_DSN;
   const endpoint = sentryEndpoint(dsn);
-  const enabled = environment.STATEWRIGHT_SENTRY_DISABLED !== "true" && Boolean(endpoint);
+  const enabled = environment.STATEWRIGHT_SENTRY_ENABLED === "true" && environment.STATEWRIGHT_SENTRY_DISABLED !== "true" && Boolean(endpoint);
   const seen = /* @__PURE__ */ new Set();
   const tags = {
     plugin: redactString(plugin ?? "unknown", 120),

@@ -17,7 +17,7 @@ test("error reporter sends one scrubbed envelope and deduplicates repeated failu
   const reporter = createErrorReporter({
     plugin: "codex",
     version: "0.3.0",
-    environment: { NODE_ENV: "test" },
+    environment: { NODE_ENV: "test", STATEWRIGHT_SENTRY_ENABLED: "true" },
     send: async (payload) => { sent.push(payload); },
   });
   assert.equal(await reporter.report(new Error("api_key=secret"), { mechanism: "child_exit", exit_code: 2, prompt: "hidden" }), true);
@@ -36,7 +36,7 @@ test("Sentry endpoint preserves a self-hosted path prefix and failed delivery re
   let attempts = 0;
   const reporter = createErrorReporter({
     plugin: "codex",
-    environment: { NODE_ENV: "test" },
+    environment: { NODE_ENV: "test", STATEWRIGHT_SENTRY_ENABLED: "true" },
     send: async () => { attempts += 1; if (attempts === 1) throw new Error("offline"); },
   });
   assert.equal(await reporter.report(new Error("same failure"), { mechanism: "child_exit" }), false);
@@ -44,6 +44,28 @@ test("Sentry endpoint preserves a self-hosted path prefix and failed delivery re
   assert.equal(attempts, 2);
   const envelope = formatEnvelope({ dsn: "https://public@example.test/12", event: { event_id: "event", timestamp: "2026-08-25T00:00:00.000Z", tags: {}, exception: { values: [{ value: "Unexpected plugin failure (message withheld)." }] } } });
   assert.doesNotMatch(envelope, /same failure|secret/);
+});
+
+test("error reporting is opt-in and the disable switch wins", async () => {
+  const sent = [];
+  const defaultReporter = createErrorReporter({
+    plugin: "codex",
+    environment: { NODE_ENV: "test" },
+    send: async (payload) => { sent.push(payload); },
+  });
+  assert.equal(await defaultReporter.report(new Error("not opted in"), { mechanism: "test" }), false);
+
+  const disabledReporter = createErrorReporter({
+    plugin: "codex",
+    environment: {
+      NODE_ENV: "test",
+      STATEWRIGHT_SENTRY_ENABLED: "true",
+      STATEWRIGHT_SENTRY_DISABLED: "true",
+    },
+    send: async (payload) => { sent.push(payload); },
+  });
+  assert.equal(await disabledReporter.report(new Error("explicitly disabled"), { mechanism: "test" }), false);
+  assert.equal(sent.length, 0);
 });
 
 test("normal exits and normal websocket closes are not error conditions", () => {

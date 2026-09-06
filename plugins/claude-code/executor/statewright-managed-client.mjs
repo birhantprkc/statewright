@@ -35,7 +35,7 @@ function usage() {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const reporter = createErrorReporter({ plugin: options.host === "claude" ? "claude-code" : "codex", version: "0.3.0" });
+  const reporter = createErrorReporter({ plugin: options.host === "claude" ? "claude-code" : "codex", version: "0.3.1" });
   reporter.installProcessHandlers();
   if (options.help) return process.stdout.write(`${usage()}\n`);
   if (options.bootstrap) {
@@ -88,7 +88,7 @@ async function main() {
 
 if (process.argv[1] && resolve(process.argv[1]) === launcherPath) {
   main().catch(async (error) => {
-    const reporter = createErrorReporter({ plugin: "managed-client", version: "0.3.0" });
+    const reporter = createErrorReporter({ plugin: "managed-client", version: "0.3.1" });
     if (!isExpectedPluginError(error)) await reporter.report(error, { mechanism: "entrypoint", operation: "managed_client" });
     process.stderr.write(`[statewright] ${error.message}\n`);
     process.exitCode = 2;

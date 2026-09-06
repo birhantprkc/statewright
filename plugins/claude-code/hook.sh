@@ -117,6 +117,21 @@ clear_session_telemetry_state() {
   rm -f "$ACTIVE_FILE" "$CACHE_FILE" "$PROJECT_DIR/.session_hinted" "$PROJECT_DIR/.discovered_commands" "$PROJECT_DIR/.capture_enabled" "$PROJECT_DIR/.run_id" "$PROJECT_DIR/.log_seq" "$PROJECT_DIR/.state_epoch" "$PROJECT_DIR/.claude_transcript_usage.json" "$PROJECT_DIR/.stop_progress" "$PROJECT_DIR/.stop_nudges"
 }
 
+is_newer_stable_version() {
+  local current="${1%%+*}" latest="${2%%+*}" current_major current_minor current_patch latest_major latest_minor latest_patch
+  [[ "$current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+  current_major=${BASH_REMATCH[1]}
+  current_minor=${BASH_REMATCH[2]}
+  current_patch=${BASH_REMATCH[3]}
+  [[ "$latest" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+  latest_major=${BASH_REMATCH[1]}
+  latest_minor=${BASH_REMATCH[2]}
+  latest_patch=${BASH_REMATCH[3]}
+  (( latest_major > current_major ||
+    (latest_major == current_major && latest_minor > current_minor) ||
+    (latest_major == current_major && latest_minor == current_minor && latest_patch > current_patch) ))
+}
+
 # Stop continuation is local policy, so liveness does not depend on API or
 # telemetry success. State transitions reset the nudge budget for their epoch.
 reset_stop_continuation_state() {
@@ -178,6 +193,7 @@ request_interactive_route_restart() {
 
 case "$ENDPOINT" in
   user-prompt)
+    UPDATE_NOTICE=""
     # --- Plugin update check (24h TTL, async, opt-out via STATEWRIGHT_NO_UPDATE_CHECK) ---
     if [ -z "${STATEWRIGHT_NO_UPDATE_CHECK:-}" ]; then
       UPDATE_CACHE="$STATEWRIGHT_DIR/.update_cache"
@@ -192,8 +208,8 @@ case "$ENDPOINT" in
         PB_URL="${STATEWRIGHT_PB_URL:-https://statewright.ai}"
         REMOTE_VER=$(curl -sf --max-time 3 "${PB_URL}/api/plugins/versions" 2>/dev/null | jq -r '.versions["claude-code"] // empty' 2>/dev/null || true)
         echo "{\"version\":\"${LOCAL_VER}\",\"latest\":\"${REMOTE_VER}\",\"checked\":$(date +%s)}" > "$UPDATE_CACHE"
-        if [ -n "$REMOTE_VER" ] && [ "$LOCAL_VER" != "$REMOTE_VER" ]; then
-          echo "{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"Statewright plugin update available: v${LOCAL_VER} → v${REMOTE_VER}. Run: /plugin install statewright to update. Suppress with STATEWRIGHT_NO_UPDATE_CHECK=1.\"}}"
+        if is_newer_stable_version "$LOCAL_VER" "$REMOTE_VER"; then
+          UPDATE_NOTICE="Statewright plugin update available: v${LOCAL_VER} → v${REMOTE_VER}. Run: /plugin install statewright to update. Suppress with STATEWRIGHT_NO_UPDATE_CHECK=1."
         fi
       fi
     fi
@@ -230,10 +246,11 @@ case "$ENDPOINT" in
     # --- No local .active: dormant (no cross-session leak from gateway) ---
     if [ ! -f "$ACTIVE_FILE" ] && [ -z "${STATEWRIGHT_EXECUTOR_ID:-}" ]; then
       HINT_FILE="$PROJECT_DIR/.session_hinted"
-      if [ ! -f "$HINT_FILE" ]; then
+      if [ ! -f "$HINT_FILE" ] || [ -n "$UPDATE_NOTICE" ]; then
         mkdir -p "$PROJECT_DIR"
         touch "$HINT_FILE"
-        echo "{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"Statewright plugin active. No workflow running. To start one, use statewright_start(workflow='bugfix') or statewright_list_workflows() to see available workflows.\"}}"
+        DORMANT_CONTEXT="Statewright plugin active. No workflow running. To start one, use statewright_start(workflow='bugfix') or statewright_list_workflows() to see available workflows.${UPDATE_NOTICE:+ $UPDATE_NOTICE}"
+        jq -n --arg ctx "$DORMANT_CONTEXT" '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":$ctx}}'
       fi
       exit 0
     fi
@@ -263,7 +280,8 @@ case "$ENDPOINT" in
       mkdir -p "$STATEWRIGHT_DIR/logs"
       project_claude_transcript_usage
       clear_session_telemetry_state
-      echo "{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"[statewright] Workflow complete. Final state: $CURRENT. Enforcement deactivated.\"}}"
+      FINAL_CONTEXT="[statewright] Workflow complete. Final state: $CURRENT. Enforcement deactivated.${UPDATE_NOTICE:+ $UPDATE_NOTICE}"
+      jq -n --arg ctx "$FINAL_CONTEXT" '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":$ctx}}'
       exit 0
     fi
 
@@ -333,7 +351,7 @@ case "$ENDPOINT" in
     if [ -n "$THINKING_LEVEL" ]; then
       MODEL_NOTE="${MODEL_NOTE} Recommended effort for this phase: $THINKING_LEVEL. Claude hooks cannot switch effort inside an active session; start or resume with --effort $THINKING_LEVEL when a launcher owns the boundary."
     fi
-    CONTEXT="Statewright workflow active. AUTONOMOUS MODE: work continuously through each state — use tools, complete the work, transition, and keep going. Do NOT stop or ask the user between states. Only pause at approval gates (requires_approval) or final states. Phase: $CURRENT (iteration $ITER/$MAX). Tools: $TOOLS. MANDATORY: Every statewright_transition call MUST include data.rationale explaining WHY you are transitioning. Format: statewright_transition(event='EVENT', data={'rationale': 'specific reason', ...guard fields}). Available transitions: $TRANSITIONS.${SM_CONTEXT:+ State context: $SM_CONTEXT.}${GUARDS_INFO:+ Guards: $GUARDS_INFO.}${BLOCKED_ENV:+ BLOCKED env vars (do not use): $BLOCKED_ENV.}${ENV_OVERRIDES:+ Use these env vars instead: $ENV_OVERRIDES.}${AVAILABLE_CMDS:+ PREFER these commands over raw shell: $AVAILABLE_CMDS.}${MODEL_NOTE}${INSTRUCTIONS:+ Instructions: $INSTRUCTIONS.}"
+    CONTEXT="Statewright workflow active. AUTONOMOUS MODE: work continuously through each state — use tools, complete the work, transition, and keep going. Do NOT stop or ask the user between states. Only pause at approval gates (requires_approval) or final states. Phase: $CURRENT (iteration $ITER/$MAX). Tools: $TOOLS. MANDATORY: Every statewright_transition call MUST include data.rationale explaining WHY you are transitioning. Format: statewright_transition(event='EVENT', data={'rationale': 'specific reason', ...guard fields}). Available transitions: $TRANSITIONS.${SM_CONTEXT:+ State context: $SM_CONTEXT.}${GUARDS_INFO:+ Guards: $GUARDS_INFO.}${BLOCKED_ENV:+ BLOCKED env vars (do not use): $BLOCKED_ENV.}${ENV_OVERRIDES:+ Use these env vars instead: $ENV_OVERRIDES.}${AVAILABLE_CMDS:+ PREFER these commands over raw shell: $AVAILABLE_CMDS.}${MODEL_NOTE}${INSTRUCTIONS:+ Instructions: $INSTRUCTIONS.}${UPDATE_NOTICE:+ $UPDATE_NOTICE}"
     jq -n --arg ctx "$CONTEXT" '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":$ctx}}'
     exit 0
     ;;

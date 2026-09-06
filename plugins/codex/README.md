@@ -6,7 +6,7 @@ State machine guardrails for [OpenAI Codex CLI](https://github.com/openai/codex)
 
 ```bash
 codex plugin marketplace add statewright/statewright
-codex plugin install statewright
+codex plugin add statewright@statewright
 ```
 
 Or manual setup:

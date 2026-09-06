@@ -14,6 +14,13 @@ import {
 
 const SESSION_ID = "01a0531f-2295-7852-b575-f9d4c2c1201b";
 
+function codexTestEnvironment(overrides = {}) {
+  const environment = { ...process.env };
+  delete environment.CODEX_HOME;
+  delete environment.CODEX_SQLITE_HOME;
+  return { ...environment, ...overrides };
+}
+
 function record(ordinal, type, payload) {
   return JSON.stringify({ timestamp: "2026-08-30T00:00:00.000Z", ordinal, type, payload });
 }
@@ -108,7 +115,7 @@ test("legacy history retains native resume behavior without mutation or backup",
     assert.equal(inspection.finalOrdinal, null);
     assert.deepEqual(inspection.unknownAnomalies, []);
 
-    const result = await guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard", backupRoot });
+    const result = await guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard", backupRoot, environment: codexTestEnvironment() });
     assert.deepEqual(result, { status: "not_applicable", historyMode: "legacy" });
     assert.equal(await readFile(rollout, "utf8"), before);
     await assert.rejects(access(backupRoot));
@@ -134,7 +141,7 @@ test("legacy history still fails closed on identity or mixed-schema anomalies", 
     assert.equal(inspection.status, "unsafe");
     assert.equal(inspection.unknownAnomalies.some((item) => item.kind === "unexpected_ordinal"), true);
     await assert.rejects(
-      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard" }),
+      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard", environment: codexTestEnvironment() }),
       /canonical identity or ordinal contract/i,
     );
   } finally { await rm(home, { recursive: true, force: true }); }
@@ -162,7 +169,7 @@ test("legacy history rejects non-record JSON and conflicting mode aliases", asyn
     assert.equal(inspection.status, "unsafe");
     assert.equal(inspection.unknownAnomalies.some((item) => item.kind === "conflicting_history_mode"), true);
     await assert.rejects(
-      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard" }),
+      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard", environment: codexTestEnvironment() }),
       /canonical identity or ordinal contract/i,
     );
   } finally { await rm(home, { recursive: true, force: true }); }
@@ -175,7 +182,7 @@ test("guard mode refuses a stale Codex resume without changing history", async (
     const rollout = await writeRollout(home, duplicateSettingsRollout());
     const before = await readFile(rollout, "utf8");
     await assert.rejects(
-      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard", backupRoot }),
+      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard", backupRoot, environment: codexTestEnvironment() }),
       /refusing to resume from a stale paginated projection/i,
     );
     assert.equal(await readFile(rollout, "utf8"), before);
@@ -192,6 +199,7 @@ test("repair mode backs up history, removes only redundant settings, and clears 
     const original = await readFile(rollout, "utf8");
     const result = await guardCodexResumeHistory({
       home, sessionId: SESSION_ID, mode: "repair", backupRoot,
+      environment: codexTestEnvironment(),
       withWriterLock: async (_options, operation) => operation(),
     });
 
@@ -221,7 +229,7 @@ test("repair mode backs up history, removes only redundant settings, and clears 
     }
     database.close();
 
-    const healthy = await guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard", backupRoot });
+    const healthy = await guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard", backupRoot, environment: codexTestEnvironment() });
     assert.equal(healthy.status, "healthy");
   } finally { await rm(home, { recursive: true, force: true }); }
 });
@@ -258,7 +266,7 @@ test("unsafe history without a trustworthy mode fails closed instead of bypassin
       record(2, "event_msg", { type: "task_complete" }),
     ]);
     await assert.rejects(
-      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard" }),
+      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "guard", environment: codexTestEnvironment() }),
       /canonical identity or ordinal contract/i,
     );
   } finally { await rm(home, { recursive: true, force: true }); }
@@ -288,6 +296,7 @@ test("source compare-and-swap refuses a concurrent append before replacement", a
     await assert.rejects(
       guardCodexResumeHistory({
         home, sessionId: SESSION_ID, mode: "repair", backupRoot,
+        environment: codexTestEnvironment(),
         withWriterLock: async (_options, operation) => operation(),
         repairOperations: {
           beforeCompareAndSwap: async () => appendFile(rollout, `${record(3, "event_msg", { type: "task_complete" })}\n`),
@@ -312,6 +321,7 @@ test("a post-commit manifest failure retains the repaired rollout and cleared ta
     await assert.rejects(
       guardCodexResumeHistory({
         home, sessionId: SESSION_ID, mode: "repair", backupRoot,
+        environment: codexTestEnvironment(),
         withWriterLock: async (_options, operation) => operation(),
         repairOperations: {
           writeManifest: async (path, value) => {
@@ -401,7 +411,7 @@ test("environment storage overrides repair the effective Codex home and SQLite p
     let lockOptions = null;
     const result = await guardCodexResumeHistory({
       home, cwd: home, args: ["-C", "effective-cwd", "resume", SESSION_ID], sessionId: SESSION_ID, mode: "repair",
-      environment: { ...process.env, CODEX_HOME: codexHome, CODEX_SQLITE_HOME: "custom-sqlite" },
+      environment: codexTestEnvironment({ CODEX_HOME: codexHome, CODEX_SQLITE_HOME: "custom-sqlite" }),
       withWriterLock: async (options, operation) => { lockOptions = options; return operation(); },
     });
     assert.equal(result.status, "repaired");
@@ -431,7 +441,7 @@ test("top-level TOML sqlite_home takes precedence over the environment and durab
     const environmentProjection = createProjectionAt(join(envSqliteHome, "thread_history_1.sqlite"));
     const result = await guardCodexResumeHistory({
       home, sessionId: SESSION_ID, mode: "repair",
-      environment: { ...process.env, CODEX_SQLITE_HOME: envSqliteHome },
+      environment: codexTestEnvironment({ CODEX_SQLITE_HOME: envSqliteHome }),
       withWriterLock: async (_options, operation) => operation(),
       repairOperations: { onDurabilityEvent: async (event) => events.push(event) },
     });
@@ -498,7 +508,7 @@ test("repair aborts before backup or mutation for any unknown ordinal anomaly", 
     ]);
     const before = await readFile(rollout, "utf8");
     await assert.rejects(
-      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "repair", backupRoot }),
+      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "repair", backupRoot, environment: codexTestEnvironment() }),
       /not safe for automatic repair/i,
     );
     assert.equal(await readFile(rollout, "utf8"), before);

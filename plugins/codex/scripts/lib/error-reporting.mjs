@@ -93,7 +93,12 @@ export function createErrorReporter({
 } = {}) {
   const dsn = environment.STATEWRIGHT_SENTRY_DSN ?? DEFAULT_SENTRY_DSN;
   const endpoint = sentryEndpoint(dsn);
-  const enabled = environment.STATEWRIGHT_SENTRY_DISABLED !== "true" && Boolean(endpoint);
+  // Public plugin installs must not transmit diagnostics without an explicit
+  // operator choice. STATEWRIGHT_SENTRY_DISABLED remains an emergency kill
+  // switch for environments that centrally enable reporting.
+  const enabled = environment.STATEWRIGHT_SENTRY_ENABLED === "true"
+    && environment.STATEWRIGHT_SENTRY_DISABLED !== "true"
+    && Boolean(endpoint);
   const seen = new Set();
   const tags = {
     plugin: redactString(plugin ?? "unknown", 120),
