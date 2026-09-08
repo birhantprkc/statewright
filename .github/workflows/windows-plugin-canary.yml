@@ -70,6 +70,11 @@ jobs:
         run: |
           node plugins/executor/tests/windows-managed-client-canary.mjs
           node plugins/executor/tests/windows-managed-client-route-canary.mjs
+      - name: Prove secretless browser onboarding
+        timeout-minutes: 2
+        env:
+          STATEWRIGHT_API_KEY: ""
+        run: node plugins/executor/tests/windows-plugin-browser-onboarding-canary.mjs
       - name: Run authenticated production gateway canary
         if: github.event_name != 'pull_request'
         env:

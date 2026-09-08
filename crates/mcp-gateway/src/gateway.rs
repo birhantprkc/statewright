@@ -9,13 +9,17 @@ use crate::interceptors::{self, PreCallDecision};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, ToolCallParams, ToolInfo};
 use crate::session::SessionManager;
 use crate::upstream::UpstreamManager;
-use crate::usage::{RuntimeToolReport, RuntimeUsageReport, UsageLedger};
+use crate::usage::{RuntimeToolReport, RuntimeUsageReport, UsageDisposition, UsageLedger};
 
 /// Core MCP gateway that dispatches messages.
 pub struct Gateway {
     pub session_manager: SessionManager,
     pub upstream: UpstreamManager,
     session_id: String,
+    /// Immutable remote transport identity. A gateway may temporarily operate
+    /// on a fork branch session, but native clients must keep reporting to the
+    /// key registered in `RemoteState.sessions`.
+    transport_session_id: String,
     workflows: HashMap<String, MachineDefinition>,
     active_workflow: Option<String>,
     /// Owner ID for step metering (from PocketBase API key lookup).
@@ -34,6 +38,12 @@ pub struct Gateway {
     usage_control_token: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct NativeUsageError {
+    pub code: &'static str,
+    pub message: String,
+}
+
 impl Gateway {
     pub fn new(
         session_manager: SessionManager,
@@ -47,6 +57,7 @@ impl Gateway {
         Self {
             session_manager,
             upstream,
+            transport_session_id: session_id.clone(),
             session_id,
             workflows,
             active_workflow,
@@ -91,7 +102,8 @@ impl Gateway {
         // Remote clients report provider-native thread IDs. Preserve the
         // gateway session separately so adapters can bind telemetry to the
         // exact run without conflating the two identity domains.
-        state["run_session_id"] = json!(self.session_id);
+        state["run_session_id"] = json!(self.transport_session_id);
+        state["state_epoch"] = json!(self.usage.state_epoch());
         state["capture_output"] = json!(capture_output);
         state
     }
@@ -107,6 +119,58 @@ impl Gateway {
         let fingerprint =
             uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, api_key.as_bytes()).to_string();
         fingerprint == self.api_key_fingerprint
+    }
+
+    /// Accept provider-native usage from the authenticated client that owns
+    /// this exact remote session. The HTTP transport performs API-key/session
+    /// ownership checks before calling this method; the run/state/epoch and
+    /// sequence checks here prevent delayed or replayed reports from mutating
+    /// the active ledger.
+    pub fn report_native_usage(
+        &mut self,
+        run_id: &str,
+        report: RuntimeUsageReport,
+    ) -> Result<UsageDisposition, NativeUsageError> {
+        if self.current_run_id.as_deref() != Some(run_id) {
+            return Err(NativeUsageError {
+                code: "inactive_run",
+                message: "Usage report does not match the active run".to_string(),
+            });
+        }
+        if report.precision == "unavailable" {
+            return Err(NativeUsageError {
+                code: "unavailable",
+                message: "Unavailable usage cannot replace an active ledger total".to_string(),
+            });
+        }
+        if !matches!(report.precision.as_str(), "exact" | "mixed" | "estimated") {
+            return Err(NativeUsageError {
+                code: "invalid_precision",
+                message: "Unknown runtime usage precision".to_string(),
+            });
+        }
+        self.usage
+            .report_usage_from("native", report)
+            .map_err(|message| NativeUsageError {
+                code: if message.contains("stale or duplicated") {
+                    "duplicate_or_stale"
+                } else if message.contains("does not match a retained state epoch")
+                    || message.contains("does not match active state")
+                {
+                    "stale_state"
+                } else if message.contains("No active usage state") {
+                    "no_active_usage"
+                } else {
+                    "invalid_report"
+                },
+                message,
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_native_usage_run(&mut self, run_id: &str, state: &str) {
+        self.current_run_id = Some(run_id.to_string());
+        self.usage.start(state, None);
     }
 
     /// Create a workflow run record. Returns the generated run_id.
@@ -150,11 +214,13 @@ impl Gateway {
         }
     }
 
-    /// Fire-and-forget: append a transition to the current run (by run_id).
+    /// Advance the live usage boundary using the state actually exposed to the
+    /// client, while recording the separately useful audit label in run history.
     fn record_run_transition(
         &mut self,
         from: &str,
-        to: &str,
+        audit_to: &str,
+        usage_to: &str,
         event: &str,
         data: &serde_json::Value,
     ) {
@@ -171,11 +237,17 @@ impl Gateway {
                 session
                     .definition
                     .states
-                    .get(to)
+                    .get(usage_to)
                     .and_then(|state| state.context_budget_bytes)
             });
-        self.usage
-            .transition(from, to, event, decision_summary, context_budget);
+        let usage_from = self.usage.state_name().unwrap_or(from).to_string();
+        self.usage.transition(
+            &usage_from,
+            usage_to,
+            event,
+            decision_summary,
+            context_budget,
+        );
         let run_id = match &self.current_run_id {
             Some(id) => id.clone(),
             None => return,
@@ -184,7 +256,7 @@ impl Gateway {
         if let Some(pool) = &self.db_pool {
             let pool = pool.clone();
             let now = chrono::Utc::now().to_rfc3339();
-            let transition = serde_json::json!({"from": from, "to": to, "event": event, "timestamp": now, "data": data});
+            let transition = serde_json::json!({"from": from, "to": audit_to, "event": event, "timestamp": now, "data": data});
             tokio::spawn(async move {
                 let _ = sqlx::query(
                     "UPDATE workflow_runs \
@@ -201,7 +273,17 @@ impl Gateway {
             });
         }
         #[cfg(not(feature = "metering"))]
-        let _ = (from, to, event, data, run_id);
+        let _ = (from, audit_to, event, data, run_id);
+    }
+
+    pub(crate) fn record_external_transition(
+        &mut self,
+        from: &str,
+        to: &str,
+        event: &str,
+        data: &serde_json::Value,
+    ) {
+        self.record_run_transition(from, to, to, event, data);
     }
 
     fn usage_control_allowed(&self, arguments: &serde_json::Value) -> bool {
@@ -227,7 +309,7 @@ impl Gateway {
 
     /// Fire-and-forget: mark the current run as completed/stopped/failed.
     fn record_run_end(&mut self, final_state: &str, status: &str) {
-        let run_id = match self.current_run_id.take() {
+        let run_id = match self.current_run_id.clone() {
             Some(id) => id,
             None => return,
         };
@@ -507,6 +589,7 @@ impl Gateway {
                                         self.record_run_transition(
                                             &prev_state,
                                             &target,
+                                            &target,
                                             &format!("INTERRUPT:{}", name),
                                             &json!({"trigger_file": path}),
                                         );
@@ -563,10 +646,18 @@ impl Gateway {
             ),
             EnforcementDecision::ImplicitTransition { event, new_state } => {
                 // Apply the transition
+                let old_state = session.current_state.clone();
                 self.session_manager.update_state(
                     &self.session_id,
                     new_state.clone(),
                     session.context.clone(),
+                );
+                self.record_run_transition(
+                    &old_state,
+                    &new_state,
+                    &new_state,
+                    &event,
+                    &json!({"implicit": true}),
                 );
                 tracing::info!(
                     from = session.current_state,
@@ -654,6 +745,13 @@ impl Gateway {
                     &self.session_id,
                     new_state.clone(),
                     session.context.clone(),
+                );
+                self.record_run_transition(
+                    &old_state,
+                    &new_state,
+                    &new_state,
+                    &event,
+                    &json!({"implicit": true, "adapter": true}),
                 );
                 match self.session_manager.get(&self.session_id) {
                     Some(updated) => (
@@ -769,6 +867,7 @@ impl Gateway {
                         self.record_step();
                         self.record_run_transition(
                             &session.current_state,
+                            &target,
                             &target,
                             &format!("INTERRUPT:{}", name),
                             &json!({"trigger_file": path}),
@@ -930,6 +1029,7 @@ impl Gateway {
                         self.record_run_transition(
                             &prev_state,
                             &target,
+                            &target,
                             &format!("INTERRUPT:{}", interrupt_name),
                             &event_data,
                         );
@@ -1034,6 +1134,7 @@ impl Gateway {
                             self.record_run_transition(
                                 &session.current_state,
                                 &on_complete,
+                                &on_complete,
                                 "FORK_JOIN",
                                 &json!({"completed_branches": completed_count}),
                             );
@@ -1078,6 +1179,13 @@ impl Gateway {
                                 parent_ctx,
                             );
                             self.record_step();
+                            self.record_run_transition(
+                                &session.current_state,
+                                &on_fail,
+                                &on_fail,
+                                "FORK_JOIN_FAILED",
+                                &json!({"failed_branches": failed_count}),
+                            );
 
                             let result = json!({
                                 "joined": false,
@@ -1099,6 +1207,11 @@ impl Gateway {
                                 .iter()
                                 .find(|(_, b)| b["status"].as_str() == Some("pending"))
                                 .map(|(name, _)| name.clone());
+                            let usage_state = next_branch
+                                .as_ref()
+                                .and_then(|next| fork["branches"][next]["initial"].as_str())
+                                .unwrap_or(&session.current_state)
+                                .to_string();
 
                             if let Some(ref next) = next_branch {
                                 new_fork["current_branch"] = json!(next);
@@ -1116,6 +1229,7 @@ impl Gateway {
 
                             self.record_run_transition(
                                 &session.current_state, &session.current_state,
+                                &usage_state,
                                 &format!("BRANCH_DONE:{}", branch_name),
                                 &json!({"completed": completed_count, "remaining": total - completed_count}),
                             );
@@ -1304,9 +1418,14 @@ impl Gateway {
                                 parent_ctx,
                             );
                             self.record_step();
+                            let first_branch_state = fork_ctx["branches"][&first_branch]["initial"]
+                                .as_str()
+                                .unwrap_or(&prev_state)
+                                .to_string();
                             self.record_run_transition(
                                 &prev_state,
                                 &format!("FORK:{}", first_branch),
+                                &first_branch_state,
                                 event,
                                 &event_data,
                             );
@@ -1368,6 +1487,7 @@ impl Gateway {
                                 .to_string();
                             let on_fail = invoke["on_fail"].as_str().map(|value| value.to_string());
                             let input = invoke.get("input").cloned().unwrap_or(json!({}));
+                            let child_initial = child_definition.initial.clone();
                             self.session_manager.start_subflow(
                                 &self.session_id,
                                 machine.to_string(),
@@ -1380,6 +1500,7 @@ impl Gateway {
                             self.record_run_transition(
                                 &prev_state,
                                 &format!("SUBFLOW:{}", machine),
+                                &child_initial,
                                 event,
                                 &event_data,
                             );
@@ -1413,7 +1534,13 @@ impl Gateway {
                             final_context,
                         );
                         self.record_step();
-                        self.record_run_transition(&prev_state, &new_state, event, &event_data);
+                        self.record_run_transition(
+                            &prev_state,
+                            &new_state,
+                            &new_state,
+                            event,
+                            &event_data,
+                        );
                         if session.is_final() && session.subflow.is_some() {
                             let succeeded = new_state != "failed";
                             if let Some((child_final, parent_target)) = self
@@ -1422,6 +1549,7 @@ impl Gateway {
                             {
                                 self.record_run_transition(
                                     &child_final,
+                                    &parent_target,
                                     &parent_target,
                                     "SUBFLOW_COMPLETE",
                                     &event_data,
@@ -1626,6 +1754,7 @@ impl Gateway {
                 self.record_step();
                 self.record_run_transition(
                     &prev_state,
+                    target_state,
                     target_state,
                     "FORCE_STATE",
                     &context_patch,
@@ -2850,6 +2979,7 @@ mod tests {
             String::new(),
             None,
         );
+        gw.seed_native_usage_run("subflow-run", "planning");
 
         let begin = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -2871,6 +3001,18 @@ mod tests {
                 .current_state,
             "record"
         );
+        let state = gw
+            .handle_message(JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                method: "tools/call".into(),
+                params: Some(json!({"name":"statewright_get_state","arguments":{}})),
+                id: Some(json!(11)),
+            })
+            .await
+            .unwrap();
+        let state = tool_result_json(state);
+        assert_eq!(state["state"], "record");
+        assert_eq!(state["state_epoch"], 2);
 
         let done = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -3542,7 +3684,7 @@ mod tests {
             crate::protocol::ToolCallResult::text("match"),
         );
 
-        Gateway::new(
+        let mut gateway = Gateway::new(
             mgr,
             UpstreamManager::mock(vec![mock_edit, mock_read, mock_grep]),
             "impl-session".into(),
@@ -3550,7 +3692,9 @@ mod tests {
             Some("implicit-test".into()),
             String::new(),
             None,
-        )
+        );
+        gateway.seed_native_usage_run("implicit-run", "planning");
+        gateway
     }
 
     #[tokio::test]
@@ -3579,6 +3723,23 @@ mod tests {
         // State should have auto-advanced to implementing
         let session = gw.session_manager.get("impl-session").unwrap();
         assert_eq!(session.current_state, "implementing");
+        let state = gw.current_state_snapshot(false).unwrap();
+        assert_eq!(state["state_epoch"], 2);
+        assert_eq!(state["state"], "implementing");
+    }
+
+    #[test]
+    fn adapter_implicit_transition_advances_usage_epoch() {
+        let mut gw = implicit_transition_gateway();
+        let result = gw.adapter_pre_tool(
+            "Edit",
+            &json!({"file_path": "src/main.rs", "old_string": "a", "new_string": "b"}),
+        );
+
+        assert_eq!(result["decision"], "allow");
+        let state = gw.current_state_snapshot(false).unwrap();
+        assert_eq!(state["state"], "implementing");
+        assert_eq!(state["state_epoch"], 2);
     }
 
     #[tokio::test]
@@ -3899,7 +4060,7 @@ mod tests {
         mgr.create("fork-session".into(), def.clone());
         let mut workflows = HashMap::new();
         workflows.insert("fork-test".into(), def);
-        Gateway::new(
+        let mut gateway = Gateway::new(
             mgr,
             UpstreamManager::empty(),
             "fork-session".into(),
@@ -3907,7 +4068,9 @@ mod tests {
             Some("fork-test".into()),
             String::new(),
             None,
-        )
+        );
+        gateway.seed_native_usage_run("fork-run", "building");
+        gateway
     }
 
     #[tokio::test]
@@ -3944,6 +4107,20 @@ mod tests {
         let types_session = gw.session_manager.get("fork-session_br_types");
         assert!(types_session.is_some());
         assert_eq!(types_session.unwrap().current_state, "types_run");
+
+        let state = gw
+            .handle_message(JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                method: "tools/call".into(),
+                params: Some(json!({"name":"statewright_get_state","arguments":{}})),
+                id: Some(json!(2)),
+            })
+            .await
+            .unwrap();
+        let state = tool_result_json(state);
+        assert_eq!(state["state"], "lint_run");
+        assert_eq!(state["state_epoch"], 2);
+        assert_eq!(state["run_session_id"], "fork-session");
     }
 
     #[tokio::test]

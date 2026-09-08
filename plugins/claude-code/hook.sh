@@ -97,12 +97,11 @@ adapter_call() {
 project_claude_transcript_usage() {
   [ -n "$API_KEY" ] || return 0
   [ -n "$HOOK_SESSION" ] || return 0
-  [ -f "$CACHE_FILE" ] || return 0
-  [ -f "$PROJECT_DIR/.state_epoch" ] || return 0
   command -v node >/dev/null 2>&1 || return 0
   [ -f "$TRANSCRIPT_TELEMETRY" ] || return 0
   STATEWRIGHT_TELEMETRY_API_KEY="$API_KEY" \
     STATEWRIGHT_PB_URL="${STATEWRIGHT_PB_URL:-https://statewright.ai}" \
+    STATEWRIGHT_GATEWAY_URL="$GW_URL" \
     node "$TRANSCRIPT_TELEMETRY" \
       --session-id "$HOOK_SESSION" \
       --thread-id "$CLIENT_ID" \
@@ -110,6 +109,34 @@ project_claude_transcript_usage() {
       --run-id-file "$PROJECT_DIR/.run_id" \
       --epoch-file "$PROJECT_DIR/.state_epoch" \
       --ledger-file "$PROJECT_DIR/.claude_transcript_usage.json" \
+      --delivery-dir "$STATEWRIGHT_DIR/telemetry/claude-delivery" \
+      >>"$STATEWRIGHT_DIR/logs/claude-telemetry.log" 2>&1 || true
+}
+
+baseline_claude_transcript_usage() {
+  [ -n "$HOOK_SESSION" ] || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  [ -f "$TRANSCRIPT_TELEMETRY" ] || return 0
+  node "$TRANSCRIPT_TELEMETRY" \
+    --baseline-only \
+    --session-id "$HOOK_SESSION" \
+    --ledger-file "$PROJECT_DIR/.claude_transcript_usage.json" \
+    >>"$STATEWRIGHT_DIR/logs/claude-telemetry.log" 2>&1 || true
+}
+
+# Retry durable provider-usage delivery even when this Claude session is
+# dormant or its workflow-scoped cursor files have already been cleaned up.
+drain_claude_telemetry_outbox() {
+  [ -n "$API_KEY" ] || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  [ -f "$TRANSCRIPT_TELEMETRY" ] || return 0
+  mkdir -p "$STATEWRIGHT_DIR/logs"
+  STATEWRIGHT_TELEMETRY_API_KEY="$API_KEY" \
+    STATEWRIGHT_PB_URL="${STATEWRIGHT_PB_URL:-https://statewright.ai}" \
+    STATEWRIGHT_GATEWAY_URL="$GW_URL" \
+    node "$TRANSCRIPT_TELEMETRY" \
+      --delivery-only \
+      --delivery-dir "$STATEWRIGHT_DIR/telemetry/claude-delivery" \
       >>"$STATEWRIGHT_DIR/logs/claude-telemetry.log" 2>&1 || true
 }
 
@@ -213,6 +240,10 @@ case "$ENDPOINT" in
         fi
       fi
     fi
+
+    # The outbox is global rather than session-scoped, so a later prompt can
+    # complete delivery after workflow cleanup or a Claude restart.
+    drain_claude_telemetry_outbox
 
     # --- No API key: provisioning (runs even when dormant) ---
     if [ -z "$API_KEY" ] && [ -z "${STATEWRIGHT_ADAPTER_URL:-}" ]; then
@@ -628,17 +659,23 @@ case "$ENDPOINT" in
         # Activate enforcement
         mkdir -p "$PROJECT_DIR"
         rm -f "$PROJECT_DIR/.capture_enabled" "$PROJECT_DIR/.run_id" "$PROJECT_DIR/.log_seq" "$PROJECT_DIR/.state_epoch" "$PROJECT_DIR/.claude_transcript_usage.json"
+        mkdir -p "$STATEWRIGHT_DIR/logs"
+        # A new workflow owns only provider usage emitted after activation.
+        # Baseline before fetching state so an existing Claude transcript can
+        # never be reattributed to the new run.
+        baseline_claude_transcript_usage
         echo "{\"activated\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > "$ACTIVE_FILE"
         # Fetch and cache initial state
         STATE_JSON=$(mcp_call '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"statewright_get_state","arguments":{}},"id":1}')
         if [ -n "$STATE_JSON" ]; then
           echo "$STATE_JSON" > "$CACHE_FILE"
-          echo "1" > "$PROJECT_DIR/.state_epoch"
+          INITIAL_EPOCH=$(echo "$STATE_JSON" | jq -r '.state_epoch // 1' 2>/dev/null || echo "1")
+          case "$INITIAL_EPOCH" in ''|*[!0-9]*) INITIAL_EPOCH=1 ;; esac
+          echo "$INITIAL_EPOCH" > "$PROJECT_DIR/.state_epoch"
           reset_stop_continuation_state
           RUN_ID_STATE=$(echo "$STATE_JSON" | jq -r '.run_id // empty' 2>/dev/null || true)
           [ -n "$RUN_ID_STATE" ] && echo "$RUN_ID_STATE" > "$PROJECT_DIR/.run_id"
         fi
-        mkdir -p "$STATEWRIGHT_DIR/logs"
         project_claude_transcript_usage
         # Check for capture_output + run_id from tool result
         if [ -n "$TOOL_RESULT" ]; then
@@ -702,9 +739,15 @@ case "$ENDPOINT" in
             TRANSITION_SUCCEEDED=true
           fi
           if [ "$TRANSITION_SUCCEEDED" = "true" ]; then
-            PREV_EPOCH=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "0")
-            case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
-            echo $((PREV_EPOCH + 1)) > "$PROJECT_DIR/.state_epoch"
+            AUTHORITATIVE_EPOCH=$(echo "$STATE_JSON" | jq -r '.state_epoch // empty' 2>/dev/null || true)
+            case "$AUTHORITATIVE_EPOCH" in
+              ''|*[!0-9]*)
+                PREV_EPOCH=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "0")
+                case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
+                AUTHORITATIVE_EPOCH=$((PREV_EPOCH + 1))
+                ;;
+            esac
+            echo "$AUTHORITATIVE_EPOCH" > "$PROJECT_DIR/.state_epoch"
             reset_stop_continuation_state
           fi
 
@@ -761,7 +804,15 @@ case "$ENDPOINT" in
         if [ -f "$ACTIVE_FILE" ]; then
           STATE_JSON=$(mcp_call '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"statewright_get_state","arguments":{}},"id":1}')
           if [ -n "$STATE_JSON" ]; then
+            PREV_EPOCH=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "0")
+            AUTHORITATIVE_EPOCH=$(echo "$STATE_JSON" | jq -r '.state_epoch // empty' 2>/dev/null || true)
             echo "$STATE_JSON" > "$CACHE_FILE"
+            case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
+            case "$AUTHORITATIVE_EPOCH" in ''|*[!0-9]*) AUTHORITATIVE_EPOCH="$PREV_EPOCH" ;; esac
+            if [ "$AUTHORITATIVE_EPOCH" -gt 0 ] && [ "$AUTHORITATIVE_EPOCH" -ne "$PREV_EPOCH" ]; then
+              echo "$AUTHORITATIVE_EPOCH" > "$PROJECT_DIR/.state_epoch"
+              reset_stop_continuation_state
+            fi
           fi
         fi
         ;;

@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   BindingLedger,
+  credentialScopedDataDir,
   createLocalTelemetryServer,
   LocalTelemetryService,
   telemetryIdentity,
@@ -14,6 +15,7 @@ import {
 const dataDir = process.env.STATEWRIGHT_TELEMETRY_DIR ||
   join(homedir(), ".statewright", "telemetry", "native-codex");
 const pocketbaseUrl = process.env.STATEWRIGHT_PB_URL || "https://statewright.ai";
+const gatewayUrl = process.env.STATEWRIGHT_GATEWAY_URL || "https://mcp.statewright.ai";
 const apiKey = process.env.STATEWRIGHT_API_KEY || "";
 const rawCaptureDestination = process.env.STATEWRIGHT_RAW_TOOL_CAPTURE_DESTINATION || "";
 const codexSessionsDir = process.env.STATEWRIGHT_CODEX_SESSIONS_DIR ||
@@ -31,7 +33,7 @@ if (process.argv.includes("--bind-stdin")) {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
   const binding = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  const result = new BindingLedger(join(dataDir, "bindings.jsonl")).append(binding);
+  const result = new BindingLedger(join(credentialScopedDataDir(dataDir, apiKey), "bindings.jsonl")).append(binding);
   process.stdout.write(`${JSON.stringify({ accepted: result.duplicate ? 0 : 1 })}\n`);
   process.exit(0);
 }
@@ -39,6 +41,7 @@ if (process.argv.includes("--bind-stdin")) {
 if (process.argv.includes("--identity")) {
   process.stdout.write(`${JSON.stringify(telemetryIdentity({
     pocketbaseUrl,
+    gatewayUrl,
     apiKey,
     buildId,
     host,
@@ -52,6 +55,7 @@ if (process.argv.includes("--identity")) {
 const service = new LocalTelemetryService({
   dataDir,
   pocketbaseUrl,
+  gatewayUrl,
   apiKey,
   buildId,
   host,

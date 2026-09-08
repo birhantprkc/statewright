@@ -210,6 +210,7 @@ emit_native_telemetry() {
     -d "$binding_payload" >/dev/null 2>&1; then
     if ! printf '%s' "$binding_payload" | \
       STATEWRIGHT_TELEMETRY_DIR="$TELEMETRY_DIR" \
+      STATEWRIGHT_API_KEY="$API_KEY" \
       node "$TELEMETRY_AGENT" --bind-stdin >/dev/null 2>&1; then
       echo "[statewright] failed to durably record workflow token binding" >&2
     fi
@@ -694,7 +695,9 @@ case "$ENDPOINT" in
         rm -f "$PROJECT_DIR/.capture_enabled" "$PROJECT_DIR/.run_id" "$PROJECT_DIR/.log_seq" "$PROJECT_DIR/.telemetry_seq"
         echo "{\"activated\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > "$ACTIVE_FILE"
         echo "$STATE_JSON" > "$CACHE_FILE"
-        reset_native_telemetry_state 1
+        INITIAL_EPOCH=$(echo "$STATE_JSON" | jq -r '.state_epoch // 1' 2>/dev/null || echo "1")
+        case "$INITIAL_EPOCH" in ''|*[!0-9]*) INITIAL_EPOCH=1 ;; esac
+        reset_native_telemetry_state "$INITIAL_EPOCH"
 
         RUN_ID=$(echo "$STATE_JSON" | jq -r '.run_id // empty' 2>/dev/null || true)
         CAPTURE=$(echo "$STATE_JSON" | jq -r '.capture_output // false' 2>/dev/null || true)
@@ -746,9 +749,15 @@ case "$ENDPOINT" in
             TRANSITION_SUCCEEDED=true
           fi
           if [ "$TRANSITION_SUCCEEDED" = "true" ]; then
-            PREV_EPOCH=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "0")
-            case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
-            reset_native_telemetry_state $((PREV_EPOCH + 1))
+            AUTHORITATIVE_EPOCH=$(echo "$STATE_JSON" | jq -r '.state_epoch // empty' 2>/dev/null || true)
+            case "$AUTHORITATIVE_EPOCH" in
+              ''|*[!0-9]*)
+                PREV_EPOCH=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "0")
+                case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
+                AUTHORITATIVE_EPOCH=$((PREV_EPOCH + 1))
+                ;;
+            esac
+            reset_native_telemetry_state "$AUTHORITATIVE_EPOCH"
           fi
           if [ "$IS_FINAL" = "true" ]; then
             emit_native_telemetry "workflow_completed" "$STATE_JSON"
@@ -808,7 +817,15 @@ case "$ENDPOINT" in
         if [ -f "$ACTIVE_FILE" ]; then
           STATE_JSON=$(mcp_call '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"statewright_get_state","arguments":{}},"id":1}')
           if [ -n "$STATE_JSON" ]; then
+            PREV_EPOCH=$(cat "$PROJECT_DIR/.state_epoch" 2>/dev/null || echo "0")
+            AUTHORITATIVE_EPOCH=$(echo "$STATE_JSON" | jq -r '.state_epoch // empty' 2>/dev/null || true)
             echo "$STATE_JSON" > "$CACHE_FILE"
+            case "$PREV_EPOCH" in ''|*[!0-9]*) PREV_EPOCH=0 ;; esac
+            case "$AUTHORITATIVE_EPOCH" in ''|*[!0-9]*) AUTHORITATIVE_EPOCH="$PREV_EPOCH" ;; esac
+            if [ "$AUTHORITATIVE_EPOCH" -gt 0 ] && [ "$AUTHORITATIVE_EPOCH" -ne "$PREV_EPOCH" ]; then
+              reset_native_telemetry_state "$AUTHORITATIVE_EPOCH"
+              emit_native_telemetry "state_boundary" "$STATE_JSON"
+            fi
           fi
         fi
         ;;

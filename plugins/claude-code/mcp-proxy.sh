@@ -11,6 +11,7 @@ GW_URL="${GW_URL:-https://mcp.statewright.ai}"
 PB_URL="${STATEWRIGHT_PB_URL:-https://statewright.ai}"
 KEY_FILE="$STATEWRIGHT_DIR/api_key"
 INVALID_KEY_SENTINEL="$STATEWRIGHT_DIR/invalid_api_key"
+MISSING_KEY_SENTINEL="$STATEWRIGHT_DIR/missing_api_key_prompted"
 # shellcheck source=client-id.sh
 source "${SCRIPT_DIR}/client-id.sh"
 
@@ -28,11 +29,35 @@ invalid_key_matches() {
 }
 
 open_keys_page() {
-  [ "${STATEWRIGHT_NO_BROWSER:-false}" = "true" ] && return 0
-  if command -v open >/dev/null 2>&1; then open 'https://statewright.ai/keys' >/dev/null 2>&1 &
-  elif command -v xdg-open >/dev/null 2>&1; then xdg-open 'https://statewright.ai/keys' >/dev/null 2>&1 &
-  elif command -v wslview >/dev/null 2>&1; then wslview 'https://statewright.ai/keys' >/dev/null 2>&1 &
-  elif command -v powershell.exe >/dev/null 2>&1; then powershell.exe -NoProfile Start-Process 'https://statewright.ai/keys' >/dev/null 2>&1 &
+  local url="${1:-https://statewright.ai/keys}"
+  local -a browser_command=()
+  [ "${STATEWRIGHT_NO_BROWSER:-false}" = "true" ] && return 1
+  if [ "${OS:-}" = "Windows_NT" ] && command -v powershell.exe >/dev/null 2>&1; then
+    if [ -n "${STATEWRIGHT_BROWSER_OPEN_PROBE:-}" ]; then
+      browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '${STATEWRIGHT_BROWSER_OPEN_PROBE}' -ArgumentList '$url' -Wait")
+    else
+      browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '$url'")
+    fi
+  elif command -v open >/dev/null 2>&1; then browser_command=(open "$url")
+  elif command -v xdg-open >/dev/null 2>&1; then browser_command=(xdg-open "$url")
+  elif command -v wslview >/dev/null 2>&1; then browser_command=(wslview "$url")
+  elif command -v powershell.exe >/dev/null 2>&1; then browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '$url'")
+  fi
+  [ ${#browser_command[@]} -gt 0 ] || return 1
+  if [ -n "${STATEWRIGHT_BROWSER_OPEN_CAPTURE_PATH:-}" ]; then
+    printf '%s\n' "${browser_command[@]}" >> "$STATEWRIGHT_BROWSER_OPEN_CAPTURE_PATH"
+  else
+    "${browser_command[@]}" >/dev/null 2>&1
+  fi
+}
+
+prompt_missing_key() {
+  mkdir -p "$STATEWRIGHT_DIR" 2>/dev/null || return 0
+  if [ ! -f "$MISSING_KEY_SENTINEL" ]; then
+    if open_keys_page 'https://statewright.ai/signup?redirect=/keys'; then
+      : > "$MISSING_KEY_SENTINEL"
+      chmod 600 "$MISSING_KEY_SENTINEL"
+    fi
   fi
 }
 
@@ -41,9 +66,10 @@ mark_invalid_key() {
   fingerprint=$(key_fingerprint "$1")
   mkdir -p "$STATEWRIGHT_DIR" 2>/dev/null || return 0
   if [ "$(cat "$INVALID_KEY_SENTINEL" 2>/dev/null || true)" != "$fingerprint" ]; then
-    printf '%s\n' "$fingerprint" > "$INVALID_KEY_SENTINEL"
-    chmod 600 "$INVALID_KEY_SENTINEL"
-    open_keys_page
+    if open_keys_page; then
+      printf '%s\n' "$fingerprint" > "$INVALID_KEY_SENTINEL"
+      chmod 600 "$INVALID_KEY_SENTINEL"
+    fi
   fi
 }
 
@@ -251,7 +277,7 @@ while IFS= read -r line; do
   METHOD=$(echo "$line" | jq -r '.method // empty' 2>/dev/null)
 
   if [ -n "$API_KEY" ] && ! invalid_key_matches "$API_KEY"; then
-    rm -f "$INVALID_KEY_SENTINEL"
+    rm -f "$INVALID_KEY_SENTINEL" "$MISSING_KEY_SENTINEL"
   fi
 
   if [ -n "$API_KEY" ] && invalid_key_matches "$API_KEY"; then
@@ -264,6 +290,7 @@ while IFS= read -r line; do
   if [ -z "$API_KEY" ]; then
     METHOD=$(echo "$line" | jq -r '.method // empty' 2>/dev/null)
     ID=$(echo "$line" | jq -r '.id // null' 2>/dev/null)
+    [ "$METHOD" = "notifications/initialized" ] || prompt_missing_key
 
     if [ "$METHOD" = "initialize" ]; then
       echo '{"jsonrpc":"2.0","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"statewright","version":"0.1.0"}},"id":'"$ID"'}'

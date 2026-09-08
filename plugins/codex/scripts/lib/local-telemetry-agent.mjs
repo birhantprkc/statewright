@@ -19,6 +19,10 @@ import { dirname, join } from "node:path";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_CODEX_JSONL_READ_BYTES = 1024 * 1024;
+const MAX_DURABLE_LEDGER_BYTES = 64 * 1024 * 1024;
+const MAX_DURABLE_LEDGER_RECORDS = 100_000;
+const DURABLE_LEDGER_READ_CHUNK_BYTES = 64 * 1024;
+const DEFAULT_LIVE_REQUEST_TIMEOUT_MS = 5_000;
 export const TELEMETRY_PROTOCOL_VERSION = 1;
 export const TELEMETRY_AGENT_BUILD_ID = "native-codex-otel-v1";
 const TOKEN_FIELDS = [
@@ -33,6 +37,24 @@ const TOKEN_FIELDS = [
 function text(value, max = 255) {
   if (value === null || value === undefined) return "";
   return String(value).slice(0, max);
+}
+
+async function fetchWithTimeout(fetchImpl, url, options, timeoutMs) {
+  const controller = new AbortController();
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve(fetchImpl(url, { ...options, signal: controller.signal })),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error(`request timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function count(value) {
@@ -161,6 +183,7 @@ export function inspectCodexCustomToolRecords(records, conversationId, calls = n
 
 export function telemetryIdentity({
   pocketbaseUrl,
+  gatewayUrl = "",
   apiKey,
   buildId = TELEMETRY_AGENT_BUILD_ID,
   host = "127.0.0.1",
@@ -173,6 +196,7 @@ export function telemetryIdentity({
     agent_build_id: buildId,
     config_identity: stableId("local-telemetry-config", {
       pocketbase_url: String(pocketbaseUrl || "").replace(/\/$/, ""),
+      gateway_url: String(gatewayUrl || "").replace(/\/$/, ""),
       api_key_hash: stableId("api-key", String(apiKey || "")),
       host: String(host),
       port: count(port),
@@ -180,6 +204,11 @@ export function telemetryIdentity({
       raw_capture_destination: String(rawCaptureDestination || "").replace(/\/$/, ""),
     }),
   };
+}
+
+export function credentialScopedDataDir(dataDir, apiKey) {
+  const generation = stableId("telemetry-owner", String(apiKey || "")).slice(0, 16);
+  return join(dataDir, "generations", generation);
 }
 
 /**
@@ -270,9 +299,14 @@ export function normalizeOtlpLogs(document, receivedAt = new Date().toISOString(
 
 function appendDurably(path, record) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const encoded = `${JSON.stringify(record)}\n`;
+  const currentSize = existsSync(path) ? statSync(path).size : 0;
+  if (currentSize + Buffer.byteLength(encoded) > MAX_DURABLE_LEDGER_BYTES) {
+    throw new Error(`durable telemetry ledger exceeds ${MAX_DURABLE_LEDGER_BYTES} bytes`);
+  }
   const fd = openSync(path, "a", 0o600);
   try {
-    appendFileSync(fd, `${JSON.stringify(record)}\n`, "utf8");
+    appendFileSync(fd, encoded, "utf8");
     fsyncSync(fd);
   } finally {
     closeSync(fd);
@@ -280,18 +314,41 @@ function appendDurably(path, record) {
   chmodSync(path, 0o600);
 }
 
-function readJsonLines(path) {
-  if (!existsSync(path)) return [];
-  return readFileSync(path, "utf8")
-    .split("\n")
-    .filter(Boolean)
-    .flatMap((line) => {
-      try {
-        return [JSON.parse(line)];
-      } catch {
-        return [];
+function* readJsonLines(path) {
+  if (!existsSync(path)) return;
+  const size = statSync(path).size;
+  if (size > MAX_DURABLE_LEDGER_BYTES) {
+    throw new Error(`durable telemetry ledger exceeds ${MAX_DURABLE_LEDGER_BYTES} bytes`);
+  }
+  const fd = openSync(path, "r");
+  const chunk = Buffer.allocUnsafe(DURABLE_LEDGER_READ_CHUNK_BYTES);
+  let remainder = "";
+  let records = 0;
+  try {
+    let bytesRead;
+    do {
+      bytesRead = readSync(fd, chunk, 0, chunk.length, null);
+      const lines = `${remainder}${chunk.toString("utf8", 0, bytesRead)}`.split("\n");
+      remainder = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line) continue;
+        records += 1;
+        if (records > MAX_DURABLE_LEDGER_RECORDS) {
+          throw new Error(`durable telemetry ledger exceeds ${MAX_DURABLE_LEDGER_RECORDS} records`);
+        }
+        try { yield JSON.parse(line); } catch { /* Ignore a torn final append. */ }
       }
-    });
+    } while (bytesRead > 0);
+    if (remainder) {
+      records += 1;
+      if (records > MAX_DURABLE_LEDGER_RECORDS) {
+        throw new Error(`durable telemetry ledger exceeds ${MAX_DURABLE_LEDGER_RECORDS} records`);
+      }
+      try { yield JSON.parse(remainder); } catch { /* Ignore a torn final append. */ }
+    }
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export class BindingLedger {
@@ -440,20 +497,21 @@ export class DurableOutbox {
     this.events = new Map();
     this.acked = new Set();
     this.seenEventIds = new Set();
+    this.recentEventIds = [];
     this.stateTotals = new Map();
     this.sequence = 0;
     for (const record of readJsonLines(path)) {
       if (record?.kind === "checkpoint") {
         this.sequence = Math.max(this.sequence, count(record.sequence));
         for (const eventId of record.seen_event_ids ?? []) {
-          this.seenEventIds.add(eventId);
+          this.#remember(eventId);
         }
         for (const [key, value] of Object.entries(record.state_totals ?? {})) {
           this.stateTotals.set(key, value);
         }
       } else if (record?.kind === "event" && record.event?.event_id) {
         this.events.set(record.event.event_id, record.event);
-        this.seenEventIds.add(record.event.event_id);
+        this.#remember(record.event.event_id);
         this.sequence = Math.max(this.sequence, count(record.event.sequence));
         const state = record.event.state_budget;
         if (state?.run_id && state?.state_epoch && state?.token_usage) {
@@ -469,6 +527,29 @@ export class DurableOutbox {
       } else if (record?.kind === "ack" && record.event_id) {
         this.acked.add(record.event_id);
       }
+    }
+    this.#pruneStateTotals();
+  }
+
+  #remember(eventId) {
+    if (this.seenEventIds.has(eventId)) return;
+    this.seenEventIds.add(eventId);
+    this.recentEventIds.push(eventId);
+    while (this.recentEventIds.length > 10_000) {
+      const expired = this.recentEventIds.shift();
+      if (!this.events.has(expired) || this.acked.has(expired)) this.seenEventIds.delete(expired);
+    }
+  }
+
+  #pruneStateTotals() {
+    if (this.stateTotals.size <= 1_000) return;
+    const pendingKeys = new Set(this.pending().flatMap((event) => {
+      const budget = event.state_budget;
+      return budget?.run_id && budget?.state_epoch ? [`${budget.run_id}:${budget.state_epoch}`] : [];
+    }));
+    for (const key of this.stateTotals.keys()) {
+      if (this.stateTotals.size <= 1_000) break;
+      if (!pendingKeys.has(key)) this.stateTotals.delete(key);
     }
   }
 
@@ -495,7 +576,9 @@ export class DurableOutbox {
           reported_reasoning_output_tokens: cumulative.reasoning_output_tokens,
         },
       };
+      this.stateTotals.delete(key);
       this.stateTotals.set(key, { sequence, usage: cumulative });
+      this.#pruneStateTotals();
     }
     // A delayed provider event must remain attached to the binding active when
     // it was emitted. `identity` is the latest binding for the conversation
@@ -525,7 +608,7 @@ export class DurableOutbox {
     };
     appendDurably(this.path, { kind: "event", event });
     this.events.set(event.event_id, event);
-    this.seenEventIds.add(event.event_id);
+    this.#remember(event.event_id);
     return { event, duplicate: false };
   }
 
@@ -570,7 +653,7 @@ export class DurableOutbox {
     };
     appendDurably(this.path, { kind: "event", event });
     this.events.set(event.event_id, event);
-    this.seenEventIds.add(event.event_id);
+    this.#remember(event.event_id);
     return { event, duplicate: false };
   }
 
@@ -590,18 +673,33 @@ export class DurableOutbox {
     return true;
   }
 
-  pending() {
-    return [...this.events.values()]
-      .filter((event) => !this.acked.has(event.event_id))
-      .sort((left, right) => left.sequence - right.sequence);
+  pending(limit = Number.POSITIVE_INFINITY) {
+    const pending = [];
+    for (const event of this.events.values()) {
+      if (this.acked.has(event.event_id)) continue;
+      pending.push(event);
+      if (pending.length >= limit) break;
+    }
+    return pending;
+  }
+
+  pendingCount() {
+    let count = 0;
+    for (const event of this.events.values()) if (!this.acked.has(event.event_id)) count += 1;
+    return count;
   }
 
   compact() {
     const pending = this.pending();
+    this.#pruneStateTotals();
+    const retainedIds = new Set([
+      ...this.recentEventIds,
+      ...pending.map((event) => event.event_id),
+    ]);
     const checkpoint = {
       kind: "checkpoint",
       sequence: this.sequence,
-      seen_event_ids: [...this.seenEventIds].sort(),
+      seen_event_ids: [...retainedIds].sort(),
       state_totals: Object.fromEntries(this.stateTotals),
     };
     const temporary = `${this.path}.tmp-${process.pid}`;
@@ -620,25 +718,37 @@ export class DurableOutbox {
     renameSync(temporary, this.path);
     chmodSync(this.path, 0o600);
     this.events = new Map(pending.map((event) => [event.event_id, event]));
+    this.seenEventIds = retainedIds;
+    this.recentEventIds = this.recentEventIds.filter((eventId) => retainedIds.has(eventId));
     this.acked.clear();
   }
 }
 
-class DurableLogOutbox {
+export class DurableLogOutbox {
   constructor(path) {
     this.path = path;
     this.events = new Map();
     this.acked = new Set();
     this.seenEventIds = new Set();
+    this.recentEventIds = [];
     for (const record of readJsonLines(path)) {
       if (record?.kind === "event" && record.event?.event_id) {
         this.events.set(record.event.event_id, record.event);
-        this.seenEventIds.add(record.event.event_id);
+        this.#remember(record.event.event_id);
       } else if (record?.kind === "ack" && record.event_id) {
         this.acked.add(record.event_id);
       } else if (record?.kind === "checkpoint") {
-        for (const eventId of record.seen_event_ids ?? []) this.seenEventIds.add(eventId);
+        for (const eventId of record.seen_event_ids ?? []) this.#remember(eventId);
       }
+    }
+  }
+
+  #remember(eventId) {
+    if (this.seenEventIds.has(eventId)) return;
+    this.seenEventIds.add(eventId);
+    this.recentEventIds.push(eventId);
+    while (this.recentEventIds.length > 1_000) {
+      this.seenEventIds.delete(this.recentEventIds.shift());
     }
   }
 
@@ -646,19 +756,85 @@ class DurableLogOutbox {
     if (this.seenEventIds.has(event.event_id)) return { event: this.events.get(event.event_id) ?? null, duplicate: true };
     appendDurably(this.path, { kind: "event", event });
     this.events.set(event.event_id, event);
-    this.seenEventIds.add(event.event_id);
+    this.#remember(event.event_id);
     return { event, duplicate: false };
   }
 
-  pending() {
-    return [...this.events.values()].filter((event) => !this.acked.has(event.event_id));
+  pending(limit = Number.POSITIVE_INFINITY) {
+    const pending = [];
+    for (const event of this.events.values()) {
+      if (this.acked.has(event.event_id)) continue;
+      pending.push(event);
+      if (pending.length >= limit) break;
+    }
+    return pending;
+  }
+
+  pendingCount() {
+    let count = 0;
+    for (const event of this.events.values()) if (!this.acked.has(event.event_id)) count += 1;
+    return count;
   }
 
   acknowledge(eventId) {
     if (this.acked.has(eventId)) return false;
     appendDurably(this.path, { kind: "ack", event_id: eventId, acknowledged_at: new Date().toISOString() });
     this.acked.add(eventId);
+    if (this.acked.size >= 500) this.compact();
     return true;
+  }
+
+  compact() {
+    const pending = this.pending();
+    const records = [
+      { kind: "checkpoint", seen_event_ids: this.recentEventIds },
+      ...pending.map((event) => ({ kind: "event", event })),
+    ];
+    const temporary = `${this.path}.tmp-${process.pid}`;
+    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
+    const fd = openSync(temporary, "w", 0o600);
+    try {
+      writeFileSync(fd, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, this.path);
+    chmodSync(this.path, 0o600);
+    this.events = new Map(pending.map((event) => [event.event_id, event]));
+    this.acked.clear();
+  }
+}
+
+class BoundedDiagnosticLog {
+  constructor(path, maxRecords = 100) {
+    this.path = path;
+    this.maxRecords = maxRecords;
+    this.records = [...readJsonLines(path)].slice(-maxRecords);
+  }
+
+  append(record) {
+    const bounded = {
+      event_id: text(record.event_id, 64),
+      run_id: text(record.run_id, 64),
+      status: count(record.status),
+      reason: text(record.reason, 120),
+      quarantined_at: new Date().toISOString(),
+    };
+    appendDurably(this.path, bounded);
+    this.records.push(bounded);
+    if (this.records.length <= this.maxRecords) return;
+    this.records = this.records.slice(-this.maxRecords);
+    const temporary = `${this.path}.tmp-${process.pid}`;
+    const fd = openSync(temporary, "w", 0o600);
+    try {
+      writeFileSync(fd, `${this.records.map((item) => JSON.stringify(item)).join("\n")}\n`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, this.path);
+    chmodSync(this.path, 0o600);
   }
 }
 
@@ -885,6 +1061,7 @@ export class LocalTelemetryService {
   constructor({
     dataDir,
     pocketbaseUrl,
+    gatewayUrl = "",
     apiKey,
     fetchImpl = globalThis.fetch,
     buildId = TELEMETRY_AGENT_BUILD_ID,
@@ -896,12 +1073,22 @@ export class LocalTelemetryService {
     unboundRetentionMs = 24 * 60 * 60 * 1_000,
     maxUnboundRecords = 10_000,
     activeBindingWindowMs = 6 * 60 * 60 * 1_000,
+    liveRequestTimeoutMs = DEFAULT_LIVE_REQUEST_TIMEOUT_MS,
+    primaryRequestTimeoutMs = DEFAULT_LIVE_REQUEST_TIMEOUT_MS,
+    maxDrainEvents = 100,
+    maxDrainMs = 1_500,
   }) {
-    this.bindings = new BindingLedger(join(dataDir, "bindings.jsonl"));
-    this.outbox = new DurableOutbox(join(dataDir, "outbox.jsonl"));
-    this.logOutbox = new DurableLogOutbox(join(dataDir, "tool-logs.jsonl"));
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const scopedDataDir = credentialScopedDataDir(dataDir, apiKey);
+    mkdirSync(scopedDataDir, { recursive: true, mode: 0o700 });
+    this.scopedDataDir = scopedDataDir;
+    this.bindings = new BindingLedger(join(scopedDataDir, "bindings.jsonl"));
+    this.outbox = new DurableOutbox(join(scopedDataDir, "outbox.jsonl"));
+    this.logOutbox = new DurableLogOutbox(join(scopedDataDir, "tool-logs.jsonl"));
+    this.liveUsageOutbox = new DurableLogOutbox(join(scopedDataDir, "live-usage-outbox.jsonl"));
+    this.liveUsageQuarantine = new BoundedDiagnosticLog(join(scopedDataDir, "live-usage-quarantine.jsonl"));
     this.pendingBindings = new PendingBindingLedger(
-      join(dataDir, "pending-bindings.jsonl"),
+      join(scopedDataDir, "pending-bindings.jsonl"),
       {
         correlationWindowMs,
         retentionMs: unboundRetentionMs,
@@ -909,6 +1096,7 @@ export class LocalTelemetryService {
       },
     );
     this.pocketbaseUrl = pocketbaseUrl.replace(/\/$/, "");
+    this.gatewayUrl = gatewayUrl.replace(/\/$/, "");
     this.apiKey = apiKey;
     // `capture_output` is the workflow-level opt-in. Raw Code Mode capture is
     // accepted only by the staging tenant; production needs redaction before
@@ -916,9 +1104,15 @@ export class LocalTelemetryService {
     this.rawCaptureEnabled = this.pocketbaseUrl === "https://statewright.casa.enhasa.cloud";
     this.fetchImpl = fetchImpl;
     this.activeBindingWindowMs = activeBindingWindowMs;
-    this.flushing = false;
+    this.primaryFlushing = false;
+    this.liveFlushing = false;
+    this.liveRequestTimeoutMs = liveRequestTimeoutMs;
+    this.primaryRequestTimeoutMs = primaryRequestTimeoutMs;
+    this.maxDrainEvents = maxDrainEvents;
+    this.maxDrainMs = maxDrainMs;
     this.identity = telemetryIdentity({
       pocketbaseUrl,
+      gatewayUrl,
       apiKey,
       buildId,
       host,
@@ -943,10 +1137,16 @@ export class LocalTelemetryService {
       last_error: null,
       next_attempt_at: null,
     };
+    this.liveDelivery = {
+      status: "idle",
+      consecutive_failures: 0,
+      last_error: null,
+      next_attempt_at: null,
+    };
     this.jsonlTailer = codexSessionsDir
       ? new CodexJsonlToolTailer({
         sessionsDir: codexSessionsDir,
-        cursorPath: join(dataDir, "codex-jsonl-cursors.json"),
+        cursorPath: join(scopedDataDir, "codex-jsonl-cursors.json"),
         onEvent: (event) => this.ingestCodexTool(event),
         onDiagnostic: (message) => { this.receiver.last_protocol_error = `Codex JSONL tailer: ${message}`; },
       })
@@ -1073,20 +1273,38 @@ export class LocalTelemetryService {
   }
 
   async flush() {
-    const pending = this.outbox.pending().length + this.logOutbox.pending().length;
-    if (this.flushing || !this.apiKey) return { delivered: 0, pending };
+    const pending = this.outbox.pendingCount() + this.logOutbox.pendingCount();
+    if (this.primaryFlushing || !this.apiKey) return { delivered: 0, pending };
     const nextAttemptAt = this.delivery.next_attempt_at
       ? new Date(this.delivery.next_attempt_at).getTime()
       : 0;
     if (nextAttemptAt > Date.now()) {
       return { delivered: 0, pending, deferred: true };
     }
-    this.flushing = true;
+    this.primaryFlushing = true;
     let delivered = 0;
+    let attempted = 0;
+    const drainDeadline = Date.now() + this.maxDrainMs;
     try {
-      for (const event of this.outbox.pending()) {
+      for (const event of this.outbox.pending(this.maxDrainEvents)) {
+        if (attempted >= this.maxDrainEvents || Date.now() >= drainDeadline) break;
+        attempted += 1;
+        if (
+          this.gatewayUrl &&
+          event.event === "provider_token_usage" &&
+          event.run_id &&
+          event.run_session_id &&
+          event.state_budget?.state &&
+          event.state_budget?.state_epoch &&
+          event.state_budget?.precision !== "unavailable"
+        ) {
+          // Queue the live projection before acknowledging PocketBase so a
+          // crash between the two destinations cannot lose the live update.
+          this.liveUsageOutbox.append(event);
+        }
         try {
-          const response = await this.fetchImpl(
+          const response = await fetchWithTimeout(
+            this.fetchImpl,
             `${this.pocketbaseUrl}/api/gateway/telemetry/events`,
             {
               method: "POST",
@@ -1096,9 +1314,18 @@ export class LocalTelemetryService {
               },
               body: JSON.stringify({ events: [event] }),
             },
+            this.primaryRequestTimeoutMs,
           );
           if (!response.ok) {
             throw new Error(`PocketBase telemetry upload returned HTTP ${response.status}`);
+          }
+          const receipt = await response.json().catch(() => ({}));
+          const acknowledged = [
+            ...(Array.isArray(receipt.accepted_event_ids) ? receipt.accepted_event_ids : []),
+            ...(Array.isArray(receipt.duplicate_event_ids) ? receipt.duplicate_event_ids : []),
+          ];
+          if (!acknowledged.includes(event.event_id)) {
+            throw new Error("PocketBase telemetry response did not acknowledge the submitted event ID");
           }
         } catch (error) {
           const failures = this.delivery.consecutive_failures + 1;
@@ -1114,9 +1341,12 @@ export class LocalTelemetryService {
         this.outbox.acknowledge(event.event_id);
         delivered += 1;
       }
-      for (const log of this.logOutbox.pending()) {
+      for (const log of this.logOutbox.pending(this.maxDrainEvents - attempted)) {
+        if (attempted >= this.maxDrainEvents || Date.now() >= drainDeadline) break;
+        attempted += 1;
         try {
-          const response = await this.fetchImpl(
+          const response = await fetchWithTimeout(
+            this.fetchImpl,
             `${this.pocketbaseUrl}/api/gateway/logs`,
             {
               method: "POST",
@@ -1126,6 +1356,7 @@ export class LocalTelemetryService {
               },
               body: JSON.stringify(log),
             },
+            this.primaryRequestTimeoutMs,
           );
           if (!response.ok) {
             throw new Error(`PocketBase workflow-log upload returned HTTP ${response.status}`);
@@ -1144,7 +1375,7 @@ export class LocalTelemetryService {
         this.logOutbox.acknowledge(log.event_id);
         delivered += 1;
       }
-      if (delivered > 0 && this.outbox.pending().length === 0 && this.logOutbox.pending().length === 0) {
+      if (delivered > 0 && this.outbox.pendingCount() === 0 && this.logOutbox.pendingCount() === 0) {
         this.delivery = {
           status: "healthy",
           consecutive_failures: 0,
@@ -1152,9 +1383,101 @@ export class LocalTelemetryService {
           next_attempt_at: null,
         };
       }
-      return { delivered, pending: this.outbox.pending().length + this.logOutbox.pending().length };
+      const result = { delivered, pending: this.outbox.pendingCount() + this.logOutbox.pendingCount() };
+      // The live ledger has its own lock and timeout. Awaiting it here keeps
+      // explicit flushes deterministic without holding the primary delivery
+      // lock, so another flush can continue PocketBase/log delivery even if
+      // the Gateway request stalls.
+      this.primaryFlushing = false;
+      await this.flushLive();
+      return result;
     } finally {
-      this.flushing = false;
+      this.primaryFlushing = false;
+    }
+  }
+
+  async flushLive() {
+    if (this.liveFlushing || !this.apiKey || !this.gatewayUrl) return;
+    const nextAttemptAt = this.liveDelivery.next_attempt_at
+      ? new Date(this.liveDelivery.next_attempt_at).getTime()
+      : 0;
+    if (nextAttemptAt > Date.now()) return;
+    this.liveFlushing = true;
+    let quarantined = false;
+    let attempted = 0;
+    const drainDeadline = Date.now() + this.maxDrainMs;
+    try {
+      for (const event of this.liveUsageOutbox.pending(this.maxDrainEvents)) {
+        if (attempted >= this.maxDrainEvents || Date.now() >= drainDeadline) break;
+        attempted += 1;
+        try {
+          const response = await fetchWithTimeout(
+            this.fetchImpl,
+            `${this.gatewayUrl}/api/runtime-usage`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${this.apiKey}`,
+              },
+              body: JSON.stringify({
+                run_id: event.run_id,
+                run_session_id: event.run_session_id,
+                usage: {
+                  sequence: event.sequence,
+                  state: event.state_budget.state,
+                  state_epoch: event.state_budget.state_epoch,
+                  provider: event.state_budget.provider,
+                  model: event.state_budget.model ?? event.model ?? null,
+                  effort: event.state_budget.effort ?? event.effort ?? null,
+                  precision: event.state_budget.precision,
+                  token_usage: event.state_budget.token_usage,
+                },
+              }),
+            },
+            this.liveRequestTimeoutMs,
+          );
+          if (response.status === 409) {
+            const detail = await response.json().catch(() => ({}));
+            if (!["duplicate_or_stale", "stale_state", "inactive_run", "inactive_session", "superseded", "unavailable"].includes(detail.error)) {
+              throw new Error(`Gateway runtime usage rejected report: ${detail.error ?? "unknown"}`);
+            }
+          } else if (response.status === 401 || response.status === 403) {
+            this.liveUsageQuarantine.append({
+              event_id: event.event_id,
+              run_id: event.run_id,
+              status: response.status,
+              reason: "credential_generation_mismatch",
+            });
+            this.liveUsageOutbox.acknowledge(event.event_id);
+            quarantined = true;
+            continue;
+          } else if (!response.ok) {
+            throw new Error(`Gateway runtime usage upload returned HTTP ${response.status}`);
+          }
+          this.liveUsageOutbox.acknowledge(event.event_id);
+        } catch (error) {
+          const failures = this.liveDelivery.consecutive_failures + 1;
+          const delayMs = Math.min(60_000, 1_000 * (2 ** Math.min(6, failures - 1)));
+          this.liveDelivery = {
+            status: "degraded",
+            consecutive_failures: failures,
+            last_error: text(error?.message || error, 240),
+            next_attempt_at: new Date(Date.now() + delayMs).toISOString(),
+          };
+          break;
+        }
+      }
+      if (this.liveUsageOutbox.pendingCount() === 0) {
+        this.liveDelivery = {
+          status: quarantined ? "quarantined" : "healthy",
+          consecutive_failures: 0,
+          last_error: quarantined ? "One or more reports belonged to a different credential generation" : null,
+          next_attempt_at: null,
+        };
+      }
+    } finally {
+      this.liveFlushing = false;
     }
   }
 }
@@ -1189,6 +1512,10 @@ export function createLocalTelemetryServer(service, {
           delivery_status: service.delivery.status,
           last_delivery_error: service.delivery.last_error,
           pending: service.outbox.pending().length,
+          live_delivery_status: service.liveDelivery.status,
+          last_live_delivery_error: service.liveDelivery.last_error,
+          pending_live_usage: service.liveUsageOutbox.pending().length,
+          quarantined_live_usage: service.liveUsageQuarantine.records.length,
           pending_bindings: service.pendingBindings.pending().length,
           unbound_visible: service.pendingBindings.unbound().length,
           receiver: service.receiver,

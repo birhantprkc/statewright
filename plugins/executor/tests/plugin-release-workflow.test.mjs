@@ -74,6 +74,9 @@ test("plugin release workflow resolves distinct names and curated notes", async 
     resolve(root, "plugins/executor/tests/windows-managed-client-route-canary.mjs"),
     "utf8",
   );
+  const codexProxy = await readFile(resolve(root, "plugins/codex/mcp-proxy.sh"), "utf8");
+  const codexHook = await readFile(resolve(root, "plugins/codex/hook.sh"), "utf8");
+  const claudeHook = await readFile(resolve(root, "plugins/claude-code/hook.sh"), "utf8");
   const codexManifest = JSON.parse(
     await readFile(resolve(root, "plugins/codex/.codex-plugin/plugin.json"), "utf8"),
   );
@@ -105,8 +108,18 @@ test("plugin release workflow resolves distinct names and curated notes", async 
   assert.match(windowsCanary, /name: Run managed-client bootstrap and route canaries\n\s+timeout-minutes: 3/);
   assert.match(
     windowsCanary,
+    /name: Prove secretless browser onboarding[\s\S]*STATEWRIGHT_API_KEY: ""[\s\S]*windows-plugin-browser-onboarding-canary\.mjs/,
+  );
+  assert.match(
+    windowsCanary,
     /name: Run authenticated production gateway canary\n\s+if: github\.event_name != 'pull_request'/,
   );
+  assert.ok(
+    windowsCanary.indexOf("Prove secretless browser onboarding") <
+      windowsCanary.indexOf("Run authenticated production gateway canary"),
+    "secretless onboarding must run before the production secret enters a step environment",
+  );
+  assert.match(windowsCanary, /STATEWRIGHT_API_KEY: \$\{\{ secrets\.STATEWRIGHT_PLUGIN_CANARY_API_KEY \}\}/);
   assert.match(windowsCanary, /release_ref:/);
   assert.match(windowsCanary, /git merge-base --is-ancestor HEAD origin\/main/);
   assert.match(unixCanary, /release_ref:/);
@@ -130,6 +143,14 @@ test("plugin release workflow resolves distinct names and curated notes", async 
   assert.doesNotMatch(versionCanary, /\bomp\b/);
   assert.match(windowsRouteCanary, /codex-root-session\.json/);
   assert.match(windowsRouteCanary, /root_session_id: "windows-route-session"/);
+  assert.equal(
+    codexProxy.match(/STATEWRIGHT_GATEWAY_URL="\$GW_URL"/g)?.length,
+    2,
+    "Codex collector identity and process must receive the selected Gateway URL",
+  );
+  assert.match(codexHook, /AUTHORITATIVE_EPOCH=.*\.state_epoch/);
+  assert.match(codexHook, /emit_native_telemetry "state_boundary" "\$STATE_JSON"/);
+  assert.match(claudeHook, /AUTHORITATIVE_EPOCH=.*\.state_epoch/);
 });
 
 test("release gate accepts successful exact-commit hosted canaries", async () => {
@@ -231,4 +252,48 @@ test("release gate never treats manual dispatches as release evidence", async ()
     }),
     /no successful trusted push run/,
   );
+});
+
+test("self-hosted telemetry projections are tenant-bound and monotonic", async () => {
+  const hook = await readFile(
+    resolve(root, "self-hosted/pocketbase/pb_hooks/gateway.pb.js"),
+    "utf8",
+  );
+  const migration = await readFile(
+    resolve(
+      root,
+      "self-hosted/pocketbase/pb_migrations/007_bind_telemetry_runs_and_sequences.js",
+    ),
+    "utf8",
+  );
+  const sourceMigration = await readFile(
+    resolve(
+      root,
+      "self-hosted/pocketbase/pb_migrations/008_add_usage_event_source.js",
+    ),
+    "utf8",
+  );
+
+  assert.match(hook, /external_run_id = \{:run\} && api_key_fingerprint = \{:fingerprint\}/);
+  assert.match(hook, /session_id = \{:session\} && api_key_fingerprint = \{:fingerprint\}/);
+  assert.match(hook, /Workflow run belongs to another API key/);
+  assert.doesNotMatch(hook, /existing\.set\('session_id'/);
+  assert.match(hook, /sequence <= telemetryNumber\(cursors\[channel\]\)/);
+  assert.match(hook, /telemetryPrecisionRank\(precision\) > telemetryPrecisionRank\(priorPrecision\)/);
+  assert.match(hook, /runInTransaction/);
+  assert.match(hook, /telemetryHas\(budget, 'tool_result_bytes'\)/);
+  assert.match(hook, /STATE_EPOCH_MISMATCH/);
+  assert.match(hook, /STALE_SEQUENCE/);
+  assert.match(hook, /telemetrySafeCount\(usage\[field\]\)/);
+  assert.match(hook, /error: 'stale_sequence'/);
+  assert.match(hook, /Invalid telemetry event identity or state budget/);
+  assert.match(hook, /accepted_event_ids/);
+  assert.match(hook, /duplicate_event_ids/);
+  assert.match(migration, /api_key_fingerprint/);
+  assert.match(migration, /telemetry_ownership_status/);
+  assert.match(migration, /owners\.length > 1/);
+  assert.match(migration, /sequence_cursors/);
+  assert.match(migration, /idx_usage_event_owner/);
+  assert.match(sourceMigration, /idx_usage_event_run_epoch_source_sequence/);
+  assert.match(hook, /source = \{:source\}/);
 });

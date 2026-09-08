@@ -8,21 +8,22 @@ use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use statewright_engine::MachineDefinition;
 
 use crate::gateway::Gateway;
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
+use crate::protocol::JsonRpcRequest;
 use crate::session::SessionManager;
 use crate::upstream::UpstreamManager;
+use crate::usage::{RuntimeUsageReport, UsageDisposition};
 
 /// Shared state for the remote MCP transport server.
 pub struct RemoteState {
     /// Active SSE sessions: session_id -> sender for SSE events.
-    sessions: RwLock<HashMap<String, RemoteSession>>,
+    sessions: RwLock<HashMap<String, Arc<Mutex<RemoteSession>>>>,
     /// Per-API-key session managers, shared across parent and branch sessions.
     session_managers: RwLock<HashMap<String, SessionManager>>,
     /// PocketBase URL for workflow loading.
@@ -53,6 +54,13 @@ impl RemoteState {
 struct RemoteSession {
     gateway: Gateway,
     tx: mpsc::Sender<String>,
+}
+
+#[derive(Deserialize)]
+struct NativeUsageRequest {
+    run_id: String,
+    run_session_id: String,
+    usage: RuntimeUsageReport,
 }
 
 const CLIENT_ID_HEADER: &str = "x-statewright-client-id";
@@ -224,11 +232,10 @@ async fn handle_sse(
     tx.send(endpoint_msg.to_string()).await.ok();
 
     // Store the session
-    state
-        .sessions
-        .write()
-        .await
-        .insert(session_id.clone(), RemoteSession { gateway, tx });
+    state.sessions.write().await.insert(
+        session_id.clone(),
+        Arc::new(Mutex::new(RemoteSession { gateway, tx })),
+    );
 
     tracing::info!(session_id = session_id, "SSE session established");
 
@@ -331,23 +338,25 @@ async fn handle_streamable_http(
         gateway.set_api_key_fingerprint(&api_key);
 
         let (tx, _rx) = mpsc::channel::<String>(1);
-        Some(RemoteSession { gateway, tx })
+        Some(Arc::new(Mutex::new(RemoteSession { gateway, tx })))
     } else {
         None
     };
 
-    // Now acquire write lock only for the brief insert + handle_message
-    let mut sessions = state.sessions.write().await;
-
-    if let Some(rs) = new_session {
-        // Double-check: another request may have created it while we were fetching
-        if !sessions.contains_key(&session_key) {
-            sessions.insert(session_key.clone(), rs);
-            tracing::info!(session = session_key, "HTTP session created");
+    // Hold the map lock only long enough to publish/resolve the session. Each
+    // session serializes its own Gateway independently.
+    let session = {
+        let mut sessions = state.sessions.write().await;
+        if let Some(rs) = new_session {
+            // Double-check: another request may have created it while we were fetching
+            if !sessions.contains_key(&session_key) {
+                sessions.insert(session_key.clone(), rs);
+                tracing::info!(session = session_key, "HTTP session created");
+            }
         }
-    }
-
-    let session = sessions.get_mut(&session_key).unwrap();
+        sessions.get(&session_key).cloned().unwrap()
+    };
+    let mut session = session.lock().await;
 
     // Process request
     match session.gateway.handle_message(request).await {
@@ -382,11 +391,11 @@ async fn handle_message(
     };
 
     // Verify the API key owns this session by checking the owner_id matches
-    let mut sessions = state.sessions.write().await;
-    let session = match sessions.get_mut(&query.session_id) {
+    let session = match state.sessions.read().await.get(&query.session_id).cloned() {
         Some(s) => s,
         None => return (StatusCode::NOT_FOUND, "Session not found").into_response(),
     };
+    let mut session = session.lock().await;
 
     // Validate ownership: hash the provided key and check it resolves to the same owner
     if !session.gateway.verify_owner_key(&api_key) {
@@ -400,7 +409,8 @@ async fn handle_message(
         // Send response via SSE
         if session.tx.send(response_json).await.is_err() {
             // SSE connection closed
-            sessions.remove(&query.session_id);
+            drop(session);
+            state.sessions.write().await.remove(&query.session_id);
             return (StatusCode::GONE, "SSE connection closed").into_response();
         }
     }
@@ -475,8 +485,70 @@ pub fn build_router(state: Arc<RemoteState>) -> Router {
         .route("/sse", get(handle_sse))
         .route("/message", post(handle_message))
         .route("/health", get(|| async { "ok" }))
+        .route("/api/runtime-usage", post(handle_native_usage))
         .route("/api/approval-callback", post(handle_approval_callback))
         .with_state(state)
+}
+
+/// POST /api/runtime-usage — Update the live usage ledger from provider-native
+/// telemetry. This is deliberately separate from the hidden controller tool:
+/// native clients may update only the exact session and run owned by their API
+/// key, while controller reports retain their stronger control-token boundary.
+async fn handle_native_usage(
+    State(state): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    Json(body): Json<NativeUsageRequest>,
+) -> impl IntoResponse {
+    let api_key = match headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => return (StatusCode::UNAUTHORIZED, "Authorization header required").into_response(),
+    };
+
+    let Some(session) = state
+        .sessions
+        .read()
+        .await
+        .get(&body.run_session_id)
+        .cloned()
+    else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "inactive_session",
+                "message": "Active Statewright session not found"
+            })),
+        )
+            .into_response();
+    };
+    let mut session = session.lock().await;
+    if !session.gateway.verify_owner_key(api_key) {
+        return (StatusCode::FORBIDDEN, "API key does not own this session").into_response();
+    }
+
+    match session
+        .gateway
+        .report_native_usage(&body.run_id, body.usage)
+    {
+        Ok(UsageDisposition::Applied) => StatusCode::NO_CONTENT.into_response(),
+        Ok(UsageDisposition::Superseded) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "superseded",
+                "message": "A more authoritative usage total is already recorded"
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": error.code, "message": error.message })),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /api/approval-callback — Called by PB hook when approval status changes.
@@ -498,22 +570,52 @@ async fn handle_approval_callback(
         }
     }
 
-    let sessions = state.sessions.write().await;
+    if body.status != "approved" && body.status != "rejected" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid status (expected approved or rejected)",
+        )
+            .into_response();
+    }
 
-    // Find the session that has this approval_id pending
-    let session_entry = sessions.iter().find(|(_, rs)| {
-        rs.gateway
-            .session_manager
-            .get(&rs.gateway.session_id())
-            .map_or(false, |s| {
-                s.pending_approval
-                    .as_ref()
-                    .map_or(false, |p| p.approval_id == body.approval_id)
+    let session_entry = if let Some(instance_id) = body.instance_id.as_deref() {
+        state
+            .sessions
+            .read()
+            .await
+            .get(instance_id)
+            .cloned()
+            .map(|session| (instance_id.to_string(), session))
+    } else {
+        // Compatibility for older callback producers. Never await an unrelated
+        // stream lock: a busy session must not head-of-line block approvals.
+        state
+            .sessions
+            .read()
+            .await
+            .iter()
+            .map(|(id, session)| (id.clone(), session.clone()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .find(|(_, candidate)| {
+                let Ok(session) = candidate.try_lock() else {
+                    return false;
+                };
+                session
+                    .gateway
+                    .session_manager
+                    .get(&session.gateway.session_id())
+                    .is_some_and(|machine| {
+                        machine
+                            .pending_approval
+                            .as_ref()
+                            .is_some_and(|pending| pending.approval_id == body.approval_id)
+                    })
             })
-    });
+    };
 
     let (session_id, remote_session) = match session_entry {
-        Some((sid, rs)) => (sid.clone(), rs),
+        Some(entry) => entry,
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -522,6 +624,24 @@ async fn handle_approval_callback(
                 .into_response();
         }
     };
+    let mut remote_session = remote_session.lock().await;
+    let pending_matches = remote_session
+        .gateway
+        .session_manager
+        .get(&remote_session.gateway.session_id())
+        .is_some_and(|machine| {
+            machine
+                .pending_approval
+                .as_ref()
+                .is_some_and(|pending| pending.approval_id == body.approval_id)
+        });
+    if !pending_matches {
+        return (
+            StatusCode::NOT_FOUND,
+            "No session with this pending approval",
+        )
+            .into_response();
+    }
 
     match body.status.as_str() {
         "approved" => {
@@ -543,6 +663,15 @@ async fn handle_approval_callback(
                     pending.to_state.clone(),
                     final_context,
                 );
+                remote_session.gateway.record_external_transition(
+                    &pending.from_state,
+                    &pending.to_state,
+                    &pending.event,
+                    &serde_json::json!({
+                        "approval_id": pending.approval_id,
+                        "review_note": body.review_note,
+                    }),
+                );
 
                 tracing::info!(
                     session = %session_id,
@@ -561,11 +690,7 @@ async fn handle_approval_callback(
             tracing::info!(session = %session_id, "Approval rejected, transition cancelled");
             (StatusCode::OK, "rejected").into_response()
         }
-        _ => (
-            StatusCode::BAD_REQUEST,
-            "Invalid status (expected approved or rejected)",
-        )
-            .into_response(),
+        _ => unreachable!("approval status validated before session lookup"),
     }
 }
 
@@ -574,6 +699,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use http_body_util::BodyExt;
     use serde_json::json;
     use tower::ServiceExt; // for oneshot()
 
@@ -630,11 +756,10 @@ mod tests {
         gateway.set_api_key_fingerprint(api_key);
 
         let (tx, _rx) = mpsc::channel::<String>(1);
-        state
-            .sessions
-            .write()
-            .await
-            .insert(session_id.into(), RemoteSession { gateway, tx });
+        state.sessions.write().await.insert(
+            session_id.into(),
+            Arc::new(Mutex::new(RemoteSession { gateway, tx })),
+        );
 
         state
     }
@@ -881,6 +1006,153 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn native_usage_is_bound_to_owner_session_run_state_and_sequence() {
+        let state = test_state_with_session("sess-usage", "sw_test_owner_key").await;
+        {
+            let remote_session = state
+                .sessions
+                .read()
+                .await
+                .get("sess-usage")
+                .cloned()
+                .unwrap();
+            remote_session
+                .lock()
+                .await
+                .gateway
+                .seed_native_usage_run("run-1", "working");
+        }
+
+        let report = json!({
+            "run_id": "run-1",
+            "run_session_id": "sess-usage",
+            "usage": {
+                "sequence": 1,
+                "state": "working",
+                "state_epoch": 1,
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "precision": "exact",
+                "token_usage": {
+                    "input_tokens": 10,
+                    "cached_input_tokens": 2,
+                    "cache_write_input_tokens": 3,
+                    "output_tokens": 5,
+                    "reasoning_output_tokens": 1,
+                    "total_tokens": 15
+                }
+            }
+        });
+        let send = |body: serde_json::Value, key: &'static str| {
+            build_router(state.clone()).oneshot(
+                Request::post("/api/runtime-usage")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+
+        let mut inactive_session = report.clone();
+        inactive_session["run_session_id"] = json!("expired-session");
+        let inactive_response = send(inactive_session, "sw_test_owner_key").await.unwrap();
+        assert_eq!(inactive_response.status(), StatusCode::CONFLICT);
+        let inactive_body = inactive_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&inactive_body).unwrap()["error"],
+            "inactive_session"
+        );
+
+        assert_eq!(
+            send(report.clone(), "sw_test_owner_key")
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let mut duplicate = report.clone();
+        duplicate["usage"]["token_usage"]["total_tokens"] = json!(999);
+        assert_eq!(
+            send(duplicate, "sw_test_owner_key").await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+
+        let mut unavailable = report.clone();
+        unavailable["usage"]["sequence"] = json!(2);
+        unavailable["usage"]["precision"] = json!("unavailable");
+        assert_eq!(
+            send(unavailable, "sw_test_owner_key")
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        let mut wrong_state = report.clone();
+        wrong_state["usage"]["sequence"] = json!(2);
+        wrong_state["usage"]["state"] = json!("deployed");
+        assert_eq!(
+            send(wrong_state, "sw_test_owner_key")
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        let mut wrong_run = report.clone();
+        wrong_run["usage"]["sequence"] = json!(2);
+        wrong_run["run_id"] = json!("run-foreign");
+        assert_eq!(
+            send(wrong_run, "sw_test_owner_key").await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            send(report.clone(), "sw_test_wrong_key")
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let response = {
+            let remote_session = state
+                .sessions
+                .read()
+                .await
+                .get("sess-usage")
+                .cloned()
+                .unwrap();
+            remote_session
+                .lock()
+                .await
+                .gateway
+                .handle_message(JsonRpcRequest {
+                    jsonrpc: "2.0".into(),
+                    method: "tools/call".into(),
+                    params: Some(json!({ "name": "statewright_get_usage", "arguments": {} })),
+                    id: Some(json!(9)),
+                })
+                .await
+                .unwrap()
+        };
+        let text = response.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let summaries: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(summaries[0]["precision"], "exact");
+        assert_eq!(summaries[0]["token_usage"]["cache_write_input_tokens"], 3);
+        assert_eq!(summaries[0]["token_usage"]["total_tokens"], 15);
+    }
+
     // --- Approval callback ---
 
     #[tokio::test]
@@ -933,8 +1205,8 @@ mod tests {
         // Set up a session with a pending approval
         let state = test_state_with_session("sess2", "key2").await;
         {
-            let mut sessions = state.sessions.write().await;
-            let rs = sessions.get_mut("sess2").unwrap();
+            let rs = state.sessions.read().await.get("sess2").cloned().unwrap();
+            let rs = rs.lock().await;
             rs.gateway.session_manager.set_pending_approval(
                 "sess2",
                 crate::session::PendingApproval {
@@ -956,6 +1228,7 @@ mod tests {
                     .body(Body::from(
                         json!({
                             "approval_id": "apr_test2",
+                            "instance_id": "sess2",
                             "status": "maybe"
                         })
                         .to_string(),
@@ -971,8 +1244,9 @@ mod tests {
     async fn approval_callback_approved_applies_transition() {
         let state = test_state_with_session("sess3", "key3").await;
         {
-            let mut sessions = state.sessions.write().await;
-            let rs = sessions.get_mut("sess3").unwrap();
+            let rs = state.sessions.read().await.get("sess3").cloned().unwrap();
+            let mut rs = rs.lock().await;
+            rs.gateway.seed_native_usage_run("run-approved", "working");
             rs.gateway.session_manager.set_pending_approval(
                 "sess3",
                 crate::session::PendingApproval {
@@ -994,6 +1268,7 @@ mod tests {
                     .body(Body::from(
                         json!({
                             "approval_id": "apr_approve",
+                            "instance_id": "sess3",
                             "status": "approved"
                         })
                         .to_string(),
@@ -1005,19 +1280,40 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Verify the transition was applied
-        let sessions = state.sessions.read().await;
-        let rs = sessions.get("sess3").unwrap();
+        let rs = state.sessions.read().await.get("sess3").cloned().unwrap();
+        let mut rs = rs.lock().await;
         let session = rs.gateway.session_manager.get("sess3").unwrap();
         assert_eq!(session.current_state, "deployed");
         assert!(session.pending_approval.is_none());
+        assert_eq!(
+            rs.gateway
+                .report_native_usage(
+                    "run-approved",
+                    crate::usage::RuntimeUsageReport {
+                        sequence: 1,
+                        state: "deployed".into(),
+                        state_epoch: 2,
+                        provider: "openai".into(),
+                        model: None,
+                        effort: None,
+                        precision: "exact".into(),
+                        token_usage: crate::usage::TokenUsage {
+                            total_tokens: 42,
+                            ..Default::default()
+                        },
+                    },
+                )
+                .unwrap(),
+            UsageDisposition::Applied
+        );
     }
 
     #[tokio::test]
     async fn approval_callback_rejected_clears_without_transition() {
         let state = test_state_with_session("sess4", "key4").await;
         {
-            let mut sessions = state.sessions.write().await;
-            let rs = sessions.get_mut("sess4").unwrap();
+            let rs = state.sessions.read().await.get("sess4").cloned().unwrap();
+            let rs = rs.lock().await;
             rs.gateway.session_manager.set_pending_approval(
                 "sess4",
                 crate::session::PendingApproval {
@@ -1039,6 +1335,7 @@ mod tests {
                     .body(Body::from(
                         json!({
                             "approval_id": "apr_reject",
+                            "instance_id": "sess4",
                             "status": "rejected"
                         })
                         .to_string(),
@@ -1050,8 +1347,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         // State should NOT have changed — still in working
-        let sessions = state.sessions.read().await;
-        let rs = sessions.get("sess4").unwrap();
+        let rs = state.sessions.read().await.get("sess4").cloned().unwrap();
+        let rs = rs.lock().await;
         let session = rs.gateway.session_manager.get("sess4").unwrap();
         assert_eq!(session.current_state, "working");
         assert!(session.pending_approval.is_none());

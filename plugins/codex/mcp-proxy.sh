@@ -86,6 +86,7 @@ RAW_CAPTURE_DESTINATION="${STATEWRIGHT_RAW_TOOL_CAPTURE_DESTINATION:-}"
 KEY_FILE="${HOME}/.statewright/api_key"
 STATEWRIGHT_DIR="${HOME}/.statewright"
 INVALID_KEY_SENTINEL="${STATEWRIGHT_DIR}/invalid_api_key"
+MISSING_KEY_SENTINEL="${STATEWRIGHT_DIR}/missing_api_key_prompted"
 REFERENCE_SEARCH="${SCRIPT_DIR}/reference-search.mjs"
 TELEMETRY_AGENT="${SCRIPT_DIR}/scripts/local-telemetry-agent.mjs"
 TELEMETRY_BOOTSTRAP="${SCRIPT_DIR}/scripts/bootstrap-native-token-telemetry.mjs"
@@ -108,11 +109,35 @@ invalid_key_matches() {
 }
 
 open_keys_page() {
-  [ "${STATEWRIGHT_NO_BROWSER:-false}" = "true" ] && return 0
-  if command -v open >/dev/null 2>&1; then open 'https://statewright.ai/keys' >/dev/null 2>&1 &
-  elif command -v xdg-open >/dev/null 2>&1; then xdg-open 'https://statewright.ai/keys' >/dev/null 2>&1 &
-  elif command -v wslview >/dev/null 2>&1; then wslview 'https://statewright.ai/keys' >/dev/null 2>&1 &
-  elif command -v powershell.exe >/dev/null 2>&1; then powershell.exe -NoProfile Start-Process 'https://statewright.ai/keys' >/dev/null 2>&1 &
+  local url="${1:-https://statewright.ai/keys}"
+  local -a browser_command=()
+  [ "${STATEWRIGHT_NO_BROWSER:-false}" = "true" ] && return 1
+  if [ "${OS:-}" = "Windows_NT" ] && command -v powershell.exe >/dev/null 2>&1; then
+    if [ -n "${STATEWRIGHT_BROWSER_OPEN_PROBE:-}" ]; then
+      browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '${STATEWRIGHT_BROWSER_OPEN_PROBE}' -ArgumentList '$url' -Wait")
+    else
+      browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '$url'")
+    fi
+  elif command -v open >/dev/null 2>&1; then browser_command=(open "$url")
+  elif command -v xdg-open >/dev/null 2>&1; then browser_command=(xdg-open "$url")
+  elif command -v wslview >/dev/null 2>&1; then browser_command=(wslview "$url")
+  elif command -v powershell.exe >/dev/null 2>&1; then browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '$url'")
+  fi
+  [ ${#browser_command[@]} -gt 0 ] || return 1
+  if [ -n "${STATEWRIGHT_BROWSER_OPEN_CAPTURE_PATH:-}" ]; then
+    printf '%s\n' "${browser_command[@]}" >> "$STATEWRIGHT_BROWSER_OPEN_CAPTURE_PATH"
+  else
+    "${browser_command[@]}" >/dev/null 2>&1
+  fi
+}
+
+prompt_missing_key() {
+  mkdir -p "$STATEWRIGHT_DIR" 2>/dev/null || return 0
+  if [ ! -f "$MISSING_KEY_SENTINEL" ]; then
+    if open_keys_page 'https://statewright.ai/signup?redirect=/keys'; then
+      : > "$MISSING_KEY_SENTINEL"
+      chmod 600 "$MISSING_KEY_SENTINEL"
+    fi
   fi
 }
 
@@ -121,9 +146,10 @@ mark_invalid_key() {
   fingerprint=$(key_fingerprint "$1")
   mkdir -p "$STATEWRIGHT_DIR" 2>/dev/null || return 0
   if [ "$(cat "$INVALID_KEY_SENTINEL" 2>/dev/null || true)" != "$fingerprint" ]; then
-    printf '%s\n' "$fingerprint" > "$INVALID_KEY_SENTINEL"
-    chmod 600 "$INVALID_KEY_SENTINEL"
-    open_keys_page
+    if open_keys_page; then
+      printf '%s\n' "$fingerprint" > "$INVALID_KEY_SENTINEL"
+      chmod 600 "$INVALID_KEY_SENTINEL"
+    fi
   fi
 }
 
@@ -237,6 +263,7 @@ start_local_telemetry_agent() {
   fi
   expected=$(STATEWRIGHT_API_KEY="$key" \
     STATEWRIGHT_PB_URL="$PB_URL" \
+    STATEWRIGHT_GATEWAY_URL="$GW_URL" \
     STATEWRIGHT_RAW_TOOL_CAPTURE_DESTINATION="$RAW_CAPTURE_DESTINATION" \
     STATEWRIGHT_TELEMETRY_DIR="$TELEMETRY_DIR" \
     node "$TELEMETRY_AGENT" --identity 2>/dev/null || true)
@@ -268,6 +295,7 @@ start_local_telemetry_agent() {
 
   STATEWRIGHT_API_KEY="$key" \
     STATEWRIGHT_PB_URL="$PB_URL" \
+    STATEWRIGHT_GATEWAY_URL="$GW_URL" \
     STATEWRIGHT_RAW_TOOL_CAPTURE_DESTINATION="$RAW_CAPTURE_DESTINATION" \
     STATEWRIGHT_TELEMETRY_DIR="$TELEMETRY_DIR" \
     nohup node "$TELEMETRY_AGENT" \
@@ -427,7 +455,7 @@ while IFS= read -r line; do
   API_KEY="${API_KEY%"${API_KEY##*[![:space:]]}"}"  # trim trailing whitespace/newlines
 
   if [ -n "$API_KEY" ] && ! invalid_key_matches "$API_KEY"; then
-    rm -f "$INVALID_KEY_SENTINEL"
+    rm -f "$INVALID_KEY_SENTINEL" "$MISSING_KEY_SENTINEL"
   fi
 
   if [ -n "$API_KEY" ] && invalid_key_matches "$API_KEY"; then
@@ -438,6 +466,7 @@ while IFS= read -r line; do
   fi
 
   if [ -z "$API_KEY" ]; then
+    [ "$METHOD" = "notifications/initialized" ] || prompt_missing_key
     if [ "$METHOD" = "tools/list" ]; then
       echo '{"jsonrpc":"2.0","result":{"tools":[{"name":"statewright_start","description":"Activate a statewright workflow for this session. Tools will be restricted per state.","inputSchema":{"type":"object","properties":{"workflow":{"type":"string","description":"Workflow name (e.g. bugfix, etl-pipeline, code-review)"}},"required":["workflow"]}},{"name":"statewright_stop","description":"Deactivate the current workflow. All tools become available again.","inputSchema":{"type":"object","properties":{}}},{"name":"statewright_get_state","description":"Get the current workflow state, allowed tools, and available transitions.","inputSchema":{"type":"object","properties":{}}},{"name":"statewright_transition","description":"Transition to the next state in the workflow.","inputSchema":{"type":"object","properties":{"event":{"type":"string","description":"Transition event name (e.g. READY, DONE, PASS, FAIL)"}},"required":["event"]}},{"name":"statewright_list_workflows","description":"List all available workflows for this user.","inputSchema":{"type":"object","properties":{}}},{"name":"statewright_search_docs","description":"Search statewright documentation for workflow schema fields, MCP tools, patterns, and troubleshooting.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Search query (e.g. guard operators, allowed_tools, approval gate)"}},"required":["query"]}},{"name":"statewright_pause","description":"Pause the current workflow. State and context are saved. Resume later with statewright_load_workflow(name, resume=true).","inputSchema":{"type":"object","properties":{}}},{"name":"statewright_get_status","description":"Get gateway status: active workflow, current state, available workflows.","inputSchema":{"type":"object","properties":{}}},{"name":"statewright_force_state","description":"Force the state machine to a specific state, bypassing guards and transitions. Only works when meta.debug is true in the workflow.","inputSchema":{"type":"object","properties":{"state":{"type":"string","description":"Target state name to jump to"},"context":{"type":"object","description":"Optional context to merge (e.g. set guard fields)"}},"required":["state"]}}]},"id":'"$ID"'}'
     elif [ "$METHOD" = "notifications/initialized" ]; then

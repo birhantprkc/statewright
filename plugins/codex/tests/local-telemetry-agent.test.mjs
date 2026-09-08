@@ -16,6 +16,8 @@ import test from "node:test";
 import {
   BindingLedger,
   createLocalTelemetryServer,
+  credentialScopedDataDir,
+  DurableLogOutbox,
   DurableOutbox,
   LocalTelemetryService,
   inspectCodexCustomToolRecords,
@@ -81,6 +83,18 @@ async function withTempDir(run) {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+}
+
+function acceptedTelemetryResponse(request, status = 202) {
+  let acceptedEventIds = [];
+  try {
+    acceptedEventIds = JSON.parse(request?.body ?? "{}").events?.map((event) => event.event_id) ?? [];
+  } catch {}
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => ({ accepted: acceptedEventIds.length, accepted_event_ids: acceptedEventIds, duplicate_event_ids: [] }),
+  };
 }
 
 test("OTLP response.completed is normalized as an exact delta without raw fields", () => {
@@ -150,7 +164,7 @@ test("Code Mode tailer primes large existing transcripts and consumes only new c
     const [event] = service.outbox.pending();
     assert.equal(event.tool.tool, "exec");
     assert.equal(event.tool.exit_code, 0);
-    const cursors = JSON.parse(readFileSync(join(directory, "telemetry", "codex-jsonl-cursors.json"), "utf8"));
+    const cursors = JSON.parse(readFileSync(join(service.scopedDataDir, "codex-jsonl-cursors.json"), "utf8"));
     assert.equal(cursors[transcript], statSync(transcript).size);
   });
 });
@@ -184,7 +198,7 @@ test("Code Mode tailer skips an oversized record and resumes at the following re
     const [event] = service.outbox.pending();
     assert.equal(event.tool.tool, "exec");
     assert.equal(event.tool.exit_code, 0);
-    const cursors = JSON.parse(readFileSync(join(directory, "telemetry", "codex-jsonl-cursors.json"), "utf8"));
+    const cursors = JSON.parse(readFileSync(join(service.scopedDataDir, "codex-jsonl-cursors.json"), "utf8"));
     assert.equal(cursors[transcript], statSync(transcript).size);
   });
 });
@@ -198,7 +212,7 @@ test("Code Mode tool telemetry preserves raw output only for capture-enabled sta
       apiKey: "local-secret",
       fetchImpl: async (url, request) => {
         requests.push({ url, request });
-        return { ok: true, status: 202 };
+        return acceptedTelemetryResponse(request);
       },
     });
     service.bind({
@@ -260,7 +274,7 @@ test("persistent collector tails a bound Code Mode session exactly once", async 
       apiKey: "local-secret",
       fetchImpl: async (url, request) => {
         requests.push({ url, request });
-        return { ok: true, status: 202 };
+        return acceptedTelemetryResponse(request);
       },
     });
     service.bind({
@@ -435,6 +449,65 @@ test("outbox deduplicates, survives restart, and acknowledges only after deliver
   });
 });
 
+test("durable outbox materializes only the requested delivery page", async () => {
+  await withTempDir((directory) => {
+    const outbox = new DurableLogOutbox(join(directory, "paged.jsonl"));
+    for (let index = 0; index < 5; index += 1) {
+      outbox.append({ event_id: String(index).padStart(64, "0"), sequence: index + 1 });
+    }
+    assert.equal(outbox.pendingCount(), 5);
+    assert.deepEqual(outbox.pending(2).map((event) => event.sequence), [1, 2]);
+  });
+});
+
+test("durable log outbox compacts acknowledged records at a bounded threshold", async () => {
+  await withTempDir(async (directory) => {
+    const path = join(directory, "bounded-log-outbox.jsonl");
+    const outbox = new DurableLogOutbox(path);
+    for (let index = 0; index < 500; index += 1) {
+      const event = { event_id: `event-${index}`, sequence: index + 1 };
+      assert.equal(outbox.append(event).duplicate, false);
+      assert.equal(outbox.acknowledge(event.event_id), true);
+    }
+    assert.equal(outbox.pending().length, 0);
+    assert.equal(readFileSync(path, "utf8").trim().split("\n").length, 1);
+
+    const restarted = new DurableLogOutbox(path);
+    assert.equal(restarted.append({ event_id: "event-499", sequence: 500 }).duplicate, true);
+  });
+});
+
+test("primary usage outbox bounds lifetime deduplication and state totals after compaction", async () => {
+  await withTempDir(async (directory) => {
+    const path = join(directory, "bounded-usage-outbox.jsonl");
+    const records = [];
+    for (let index = 0; index < 10_050; index += 1) {
+      const eventId = `historic-${index}`;
+      records.push(JSON.stringify({
+        kind: "event",
+        event: {
+          event_id: eventId,
+          sequence: index + 1,
+          state_budget: {
+            run_id: `run-${index}`,
+            state_epoch: 1,
+            token_usage: { total_tokens: index + 1 },
+          },
+        },
+      }));
+      records.push(JSON.stringify({ kind: "ack", event_id: eventId }));
+    }
+    writeFileSync(path, `${records.join("\n")}\n`);
+
+    const outbox = new DurableOutbox(path);
+    assert.equal(outbox.pending().length, 0);
+    outbox.compact();
+    const checkpoint = JSON.parse(readFileSync(path, "utf8").trim());
+    assert.equal(checkpoint.seen_event_ids.length, 10_000);
+    assert.equal(Object.keys(checkpoint.state_totals).length, 1_000);
+  });
+});
+
 test("outbox keeps delayed usage on its source-time workflow binding", async () => {
   await withTempDir(async (directory) => {
     const outbox = new DurableOutbox(join(directory, "outbox.jsonl"));
@@ -472,16 +545,18 @@ test("service uploads bound events once and keeps provider data sanitized", asyn
     const service = new LocalTelemetryService({
       dataDir: directory,
       pocketbaseUrl: "https://statewright.invalid",
+      gatewayUrl: "https://mcp.statewright.invalid",
       apiKey: "local-secret",
       correlationWindowMs: 0,
       fetchImpl: async (url, request) => {
         requests.push({ url, request });
-        return { ok: true, status: 202 };
+        return acceptedTelemetryResponse(request);
       },
     });
     service.bind({
       conversation_id: "thread-root",
       run_id: "run-1",
+      run_session_id: "gateway-session-1",
       workflow: "workflow",
       state: "implement",
       state_epoch: 1,
@@ -502,16 +577,287 @@ test("service uploads bound events once and keeps provider data sanitized", asyn
       protocol_errors: 0,
     });
     assert.deepEqual(await service.flush(), { delivered: 1, pending: 0 });
-    assert.equal(requests.length, 1);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].url, "https://statewright.invalid/api/gateway/telemetry/events");
+    assert.equal(requests[1].url, "https://mcp.statewright.invalid/api/runtime-usage");
     const payload = JSON.parse(requests[0].request.body);
     assert.equal(payload.events[0].binding_status, "bound");
     assert.equal(payload.events[0].state_budget.token_usage.total_tokens, 100);
     assert.equal(payload.events[0].token_usage_delta.total_tokens, 100);
+    const live = JSON.parse(requests[1].request.body);
+    assert.equal(live.run_id, "run-1");
+    assert.equal(live.run_session_id, "gateway-session-1");
+    assert.equal(live.usage.precision, "exact");
+    assert.equal(live.usage.token_usage.total_tokens, 100);
 
-    const durable = readFileSync(join(directory, "outbox.jsonl"), "utf8");
+    const durable = readFileSync(join(service.scopedDataDir, "outbox.jsonl"), "utf8");
     assert.equal(durable.includes("must-not-persist"), false);
     assert.equal(durable.includes("raw body"), false);
     assert.equal(durable.includes("local-secret"), false);
+  });
+});
+
+test("PocketBase delivery is acknowledged only when the receipt names the event", async () => {
+  await withTempDir(async (directory) => {
+    const service = new LocalTelemetryService({
+      dataDir: directory,
+      pocketbaseUrl: "https://statewright.invalid",
+      gatewayUrl: "https://mcp.statewright.invalid",
+      apiKey: "local-secret",
+      correlationWindowMs: 0,
+      fetchImpl: async (url) => url.includes("runtime-usage")
+        ? { ok: true, status: 204, json: async () => ({}) }
+        : {
+            ok: true,
+            status: 202,
+            json: async () => ({ accepted: 1, accepted_event_ids: ["another-event"], duplicate_event_ids: [] }),
+          },
+    });
+    service.bind({
+      conversation_id: "thread-root", run_id: "run-1", run_session_id: "gateway-session-1",
+      workflow: "workflow", state: "implement", state_epoch: 1,
+      effective_at: "2026-07-27T11:59:00.000Z",
+    });
+    service.ingestOtlp(otlpFixture());
+
+    assert.deepEqual(await service.flush(), { delivered: 0, pending: 1 });
+    assert.equal(service.outbox.pending().length, 1);
+    assert.match(service.delivery.last_error, /did not acknowledge the submitted event ID/);
+  });
+});
+
+test("PocketBase delivery advances while live usage retries independently across restart", async () => {
+  await withTempDir(async (directory) => {
+    const firstRequests = [];
+    const options = {
+      dataDir: directory,
+      pocketbaseUrl: "https://statewright.invalid",
+      gatewayUrl: "https://mcp.statewright.invalid",
+      apiKey: "local-secret",
+      correlationWindowMs: 0,
+    };
+    const service = new LocalTelemetryService({
+      ...options,
+      fetchImpl: async (url, request) => {
+        firstRequests.push(url);
+        return url.includes("runtime-usage")
+          ? { ok: false, status: 503, json: async () => ({}) }
+          : acceptedTelemetryResponse(request);
+      },
+    });
+    service.bind({
+      conversation_id: "thread-root",
+      run_id: "run-1",
+      run_session_id: "gateway-session-1",
+      workflow: "workflow",
+      state: "implement",
+      state_epoch: 1,
+      effective_at: "2026-07-27T11:59:00.000Z",
+    });
+    service.ingestOtlp(otlpFixture());
+
+    assert.deepEqual(await service.flush(), { delivered: 1, pending: 0 });
+    assert.equal(service.outbox.pending().length, 0, "PocketBase must remain acknowledged");
+    assert.equal(service.liveUsageOutbox.pending().length, 1);
+    assert.equal(service.liveDelivery.status, "degraded");
+
+    const retryRequests = [];
+    const restarted = new LocalTelemetryService({
+      ...options,
+      fetchImpl: async (url) => {
+        retryRequests.push(url);
+        return { ok: true, status: 204, json: async () => ({}) };
+      },
+    });
+    assert.deepEqual(await restarted.flush(), { delivered: 0, pending: 0 });
+    assert.deepEqual(retryRequests, ["https://mcp.statewright.invalid/api/runtime-usage"]);
+    assert.equal(restarted.liveUsageOutbox.pending().length, 0);
+  });
+});
+
+test("an inactive live session is terminal and cannot poison later usage delivery", async () => {
+  await withTempDir(async (directory) => {
+    let liveRequests = 0;
+    const service = new LocalTelemetryService({
+      dataDir: directory,
+      pocketbaseUrl: "https://statewright.invalid",
+      gatewayUrl: "https://mcp.statewright.invalid",
+      apiKey: "local-secret",
+      correlationWindowMs: 0,
+      fetchImpl: async (url, request) => {
+        if (!url.includes("runtime-usage")) return acceptedTelemetryResponse(request);
+        liveRequests += 1;
+        if (liveRequests === 1) {
+          return { ok: false, status: 409, json: async () => ({ error: "inactive_session" }) };
+        }
+        return { ok: true, status: 204, json: async () => ({}) };
+      },
+    });
+    service.bind({
+      conversation_id: "thread-root",
+      run_id: "run-1",
+      run_session_id: "gateway-session-1",
+      workflow: "workflow",
+      state: "implement",
+      state_epoch: 1,
+      effective_at: "2026-07-27T11:59:00.000Z",
+    });
+
+    service.ingestOtlp(otlpFixture());
+    await service.flush();
+    assert.equal(service.liveUsageOutbox.pending().length, 0);
+
+    service.ingestOtlp(otlpFixture({
+      sourceTime: "2026-07-27T12:00:02.000Z",
+      timeUnixNano: "1785153602000000000",
+      total: 150,
+    }));
+    await service.flush();
+    assert.equal(liveRequests, 2);
+    assert.equal(service.liveUsageOutbox.pending().length, 0);
+    assert.equal(service.liveDelivery.status, "healthy");
+  });
+});
+
+test("a rotated credential quarantines its rejected generation without blocking newer live usage", async () => {
+  await withTempDir(async (directory) => {
+    let liveRequests = 0;
+    const service = new LocalTelemetryService({
+      dataDir: directory,
+      pocketbaseUrl: "https://statewright.invalid",
+      gatewayUrl: "https://mcp.statewright.invalid",
+      apiKey: "rotated-secret",
+      correlationWindowMs: 0,
+      fetchImpl: async (url, request) => {
+        if (!url.includes("runtime-usage")) return acceptedTelemetryResponse(request);
+        liveRequests += 1;
+        return liveRequests === 1
+          ? { ok: false, status: 401, json: async () => ({}) }
+          : { ok: true, status: 204, json: async () => ({}) };
+      },
+    });
+    service.bind({
+      conversation_id: "thread-root",
+      run_id: "run-1",
+      run_session_id: "gateway-session-1",
+      workflow: "workflow",
+      state: "implement",
+      state_epoch: 1,
+      effective_at: "2026-07-27T11:59:00.000Z",
+    });
+
+    service.ingestOtlp(otlpFixture());
+    await service.flush();
+    assert.equal(service.liveUsageOutbox.pending().length, 0);
+    assert.equal(service.liveUsageQuarantine.records.length, 1);
+    assert.equal(service.liveDelivery.status, "quarantined");
+
+    service.ingestOtlp(otlpFixture({
+      sourceTime: "2026-07-27T12:00:02.000Z",
+      timeUnixNano: "1785153602000000000",
+      total: 150,
+    }));
+    await service.flush();
+    assert.equal(liveRequests, 2);
+    assert.equal(service.liveUsageOutbox.pending().length, 0);
+    assert.equal(service.liveUsageQuarantine.records.length, 1);
+    assert.equal(service.liveDelivery.status, "healthy");
+
+    const nextGeneration = new LocalTelemetryService({
+      dataDir: directory,
+      pocketbaseUrl: "https://statewright.invalid",
+      gatewayUrl: "https://mcp.statewright.invalid",
+      apiKey: "newer-secret",
+      correlationWindowMs: 0,
+      fetchImpl: async () => ({ ok: true, status: 204, json: async () => ({}) }),
+    });
+    assert.equal(nextGeneration.liveUsageOutbox.pending().length, 0);
+    assert.equal(nextGeneration.outbox.pending().length, 0, "rotated credentials must not replay PocketBase events");
+    assert.equal(nextGeneration.logOutbox.pending().length, 0, "rotated credentials must not replay tool logs");
+    assert.equal(nextGeneration.pendingBindings.pending().length, 0, "rotated credentials must not inherit unbound provider events");
+  });
+});
+
+test("a hung PocketBase request times out without blocking live usage", async () => {
+  await withTempDir(async (directory) => {
+    let liveRequests = 0;
+    const service = new LocalTelemetryService({
+      dataDir: directory,
+      pocketbaseUrl: "https://statewright.invalid",
+      gatewayUrl: "https://mcp.statewright.invalid",
+      apiKey: "local-secret",
+      correlationWindowMs: 0,
+      primaryRequestTimeoutMs: 25,
+      fetchImpl: async (url) => {
+        if (url.includes("telemetry/events")) return new Promise(() => {});
+        liveRequests += 1;
+        return { ok: true, status: 204, json: async () => ({}) };
+      },
+    });
+    service.bind({
+      conversation_id: "thread-root",
+      run_id: "run-1",
+      run_session_id: "gateway-session-1",
+      workflow: "workflow",
+      state: "implement",
+      state_epoch: 1,
+      effective_at: "2026-07-27T11:59:00.000Z",
+    });
+    service.ingestOtlp(otlpFixture());
+    assert.deepEqual(await service.flush(), { delivered: 0, pending: 1 });
+    assert.equal(liveRequests, 1);
+    assert.equal(service.liveUsageOutbox.pending().length, 0);
+    assert.equal(service.outbox.pending().length, 1);
+    assert.match(service.delivery.last_error, /timed out/);
+  });
+});
+
+test("a hung live usage request cannot block later PocketBase delivery", async () => {
+  await withTempDir(async (directory) => {
+    const pocketbaseBodies = [];
+    let markLiveStarted;
+    const liveStarted = new Promise((resolve) => { markLiveStarted = resolve; });
+    const service = new LocalTelemetryService({
+      dataDir: directory,
+      pocketbaseUrl: "https://statewright.invalid",
+      gatewayUrl: "https://mcp.statewright.invalid",
+      apiKey: "local-secret",
+      correlationWindowMs: 0,
+      liveRequestTimeoutMs: 30,
+      fetchImpl: async (url, request) => {
+        if (url.includes("runtime-usage")) {
+          markLiveStarted();
+          return new Promise(() => {});
+        }
+        pocketbaseBodies.push(JSON.parse(request.body));
+        return acceptedTelemetryResponse(request);
+      },
+    });
+    service.bind({
+      conversation_id: "thread-root",
+      run_id: "run-1",
+      run_session_id: "gateway-session-1",
+      workflow: "workflow",
+      state: "implement",
+      state_epoch: 1,
+      effective_at: "2026-07-27T11:59:00.000Z",
+    });
+    service.ingestOtlp(otlpFixture());
+
+    const stalledFlush = service.flush();
+    await liveStarted;
+    service.ingestOtlp(otlpFixture({
+      sourceTime: "2026-07-27T12:00:02.000Z",
+      timeUnixNano: "1785153602000000000",
+      total: 150,
+    }));
+    assert.deepEqual(await service.flush(), { delivered: 1, pending: 0 });
+    assert.equal(pocketbaseBodies.length, 2, "primary delivery must proceed while live drain is busy");
+
+    assert.deepEqual(await stalledFlush, { delivered: 1, pending: 0 });
+    assert.equal(service.liveDelivery.status, "degraded");
+    assert.match(service.liveDelivery.last_error, /timed out/);
+    assert.equal(service.liveUsageOutbox.pending().length, 2);
   });
 });
 
@@ -588,13 +934,13 @@ test("binding CLI durably records a boundary while the receiver is unavailable",
       effective_at: "2026-07-27T11:59:00.000Z",
     };
     const output = execFileSync(process.execPath, [script, "--bind-stdin"], {
-      env: { ...process.env, STATEWRIGHT_TELEMETRY_DIR: directory },
+      env: { ...process.env, STATEWRIGHT_TELEMETRY_DIR: directory, STATEWRIGHT_API_KEY: "" },
       input: JSON.stringify(binding),
       encoding: "utf8",
     });
     assert.deepEqual(JSON.parse(output), { accepted: 1 });
     assert.equal(
-      new BindingLedger(join(directory, "bindings.jsonl"))
+      new BindingLedger(join(credentialScopedDataDir(directory, ""), "bindings.jsonl"))
         .resolve("thread-root", "2026-07-27T12:00:00.000Z")
         .state,
       "implement",
@@ -615,7 +961,7 @@ test("live receiver refreshes a binding appended through the fallback CLI", asyn
       new URL("../scripts/local-telemetry-agent.mjs", import.meta.url),
     );
     execFileSync(process.execPath, [script, "--bind-stdin"], {
-      env: { ...process.env, STATEWRIGHT_TELEMETRY_DIR: directory },
+      env: { ...process.env, STATEWRIGHT_TELEMETRY_DIR: directory, STATEWRIGHT_API_KEY: "secret" },
       input: JSON.stringify({
         conversation_id: "thread-root",
         run_id: "run-1",
@@ -744,7 +1090,7 @@ test("never-bound records are queryable locally and retention bounded", async ()
     assert.equal(unbound[0].conversation_id, "unknown-two");
     assert.equal(unbound[0].binding_status, "unbound");
     assert.equal(unbound[0].token_usage_delta.total_tokens, 100);
-    const durable = readFileSync(join(directory, "pending-bindings.jsonl"), "utf8");
+    const durable = readFileSync(join(service.scopedDataDir, "pending-bindings.jsonl"), "utf8");
     assert.equal(durable.includes("unknown-one"), false);
     assert.equal(durable.includes("unknown-two"), true);
 
@@ -775,7 +1121,7 @@ test("expired unbound records are physically removed from the ledger", async () 
       "2026-07-27T12:00:10.000Z",
     );
     assert.equal(service.pendingBindings.pending().length, 0);
-    const durable = readFileSync(join(directory, "pending-bindings.jsonl"), "utf8");
+    const durable = readFileSync(join(service.scopedDataDir, "pending-bindings.jsonl"), "utf8");
     assert.equal(durable.includes("expired-thread"), false);
   });
 });
@@ -788,9 +1134,9 @@ test("transport failures retain events and degrade delivery without rejecting", 
       pocketbaseUrl: "https://statewright.invalid",
       apiKey: "secret",
       correlationWindowMs: 0,
-      fetchImpl: async () => {
+      fetchImpl: async (_url, request) => {
         if (shouldFail) throw new Error("network unavailable");
-        return { ok: true, status: 202 };
+        return acceptedTelemetryResponse(request);
       },
     });
     service.bind({
@@ -860,7 +1206,7 @@ test("loopback OTLP endpoint durably appends before acknowledging", async () => 
         body: JSON.stringify(otlpFixture()),
       });
       assert.equal(usageResponse.status, 200);
-      const durable = readFileSync(join(directory, "outbox.jsonl"), "utf8");
+      const durable = readFileSync(join(service.scopedDataDir, "outbox.jsonl"), "utf8");
       assert.equal(durable.includes('"kind":"event"'), true);
       assert.equal(durable.includes('"total_tokens":100'), true);
     } finally {
