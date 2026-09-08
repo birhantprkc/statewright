@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runManagedClient } from "../lib/managed-client-supervisor.mjs";
+import { runManagedClient, windowsProcessTreeEnvironment } from "../lib/managed-client-supervisor.mjs";
 
 if (process.platform !== "win32") {
   throw new Error("The Windows managed-client route canary must run on a Windows runner.");
@@ -40,8 +40,14 @@ appendFileSync(calls, JSON.stringify({
 const marker = join(control, "route-written");
 if (!existsSync(marker)) {
   writeFileSync(marker, "");
+  writeFileSync(join(control, "codex-root-session.json"), JSON.stringify({
+    version: 1,
+    session_id: "windows-route-session",
+    client_id: process.env.STATEWRIGHT_CLIENT_ID,
+  }));
   writeFileSync(join(control, "route.json"), JSON.stringify({
     session_id: "windows-route-session",
+    root_session_id: "windows-route-session",
     client_id: process.env.STATEWRIGHT_CLIENT_ID,
     model: "openai-codex/gpt-5.6-sol",
     effort: "high",
@@ -57,16 +63,26 @@ if (!existsSync(marker)) {
   await chmod(fixture, 0o755);
   await writeFile(launcher, `@echo off\r\n"${process.execPath}" "${fixture}" %*\r\n`);
 
+  console.log("[windows-route-canary] START managed .cmd route/restart");
   const result = await runManagedClient({
     host: "codex",
     command: launcher,
     args: ["--full-auto"],
-    environment: { ...process.env, STATEWRIGHT_API_KEY: "test" },
+    environment: {
+      ...windowsProcessTreeEnvironment(process.env),
+      HOME: home,
+      USERPROFILE: home,
+      HOMEDRIVE: home.slice(0, 2),
+      HOMEPATH: home.slice(2),
+      STATEWRIGHT_API_KEY: "windows-route-canary",
+      STATEWRIGHT_SENTRY_DISABLED: "true",
+    },
     home,
     cwd: root,
     pollMs: 5,
     bridgeFactory: fakeBridgeFactory,
   });
+  console.log(`[windows-route-canary] END managed .cmd route/restart code=${result}`);
   const invocations = (await readFile(calls, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(
     result,

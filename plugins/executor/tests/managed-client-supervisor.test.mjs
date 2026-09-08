@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { access, chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { bindManagedClientIdentity, resolveManagedClientIdentity, resumedSessionId } from "../lib/managed-client-identity.mjs";
-import { bootstrapManagedClients, buildRoutedArgs, codexAllSessionsRequested, codexOneShotInvocation, managedClientChildEnvironment, managedClientEnabled, resolveRealBinary, routeClaudeModel, runManagedClient, setManagedClientEnabled, uninstallManagedClients } from "../lib/managed-client-supervisor.mjs";
+import { bootstrapManagedClients, buildRoutedArgs, codexAllSessionsRequested, codexOneShotInvocation, managedClientChildEnvironment, managedClientEnabled, resolveRealBinary, restartManagedChild, routeClaudeModel, runManagedClient, setManagedClientEnabled, terminateWindowsProcessTree, uninstallManagedClients, windowsProcessTreeEnvironment } from "../lib/managed-client-supervisor.mjs";
 
 function fakeBridgeFactory() {
   return {
@@ -27,6 +28,74 @@ async function waitFor(condition, attempts = 40) {
     await delay(25);
   }
   return false;
+}
+
+test("Windows process-tree cleanup excludes managed-client and CI credentials", async () => {
+  const taskkill = new EventEmitter();
+  taskkill.kill = () => true;
+  taskkill.unref = () => {};
+  let invocation;
+  const resultPromise = terminateWindowsProcessTree({ pid: 4242 }, {
+    environment: {
+      Path: "C:\\Windows\\System32",
+      SystemRoot: "C:\\Windows",
+      TEMP: "C:\\Temp",
+      STATEWRIGHT_API_KEY: "secret-statewright-key",
+      GITHUB_TOKEN: "secret-github-token",
+    },
+    spawnImpl(command, args, options) {
+      invocation = { command, args, options };
+      queueMicrotask(() => taskkill.emit("close", 0, null));
+      return taskkill;
+    },
+    timeoutMs: 50,
+    closeGraceMs: 10,
+  });
+  assert.deepEqual(await resultPromise, { status: "success", code: 0, signal: null });
+  assert.equal(invocation.command, "taskkill.exe");
+  assert.deepEqual(invocation.args, ["/PID", "4242", "/T", "/F"]);
+  assert.deepEqual(invocation.options.env, {
+    Path: "C:\\Windows\\System32",
+    SystemRoot: "C:\\Windows",
+    TEMP: "C:\\Temp",
+  });
+  assert.equal("STATEWRIGHT_API_KEY" in invocation.options.env, false);
+  assert.equal("GITHUB_TOKEN" in invocation.options.env, false);
+});
+
+test("Windows process-tree cleanup settles after a bounded taskkill timeout", async () => {
+  const taskkill = new EventEmitter();
+  let killed = false;
+  let unrefed = false;
+  taskkill.kill = () => { killed = true; return true; };
+  taskkill.unref = () => { unrefed = true; };
+  const result = await terminateWindowsProcessTree({ pid: 4242 }, {
+    environment: { Path: "C:\\Windows\\System32", STATEWRIGHT_API_KEY: "secret" },
+    spawnImpl: () => taskkill,
+    timeoutMs: 10,
+    closeGraceMs: 5,
+  });
+  assert.deepEqual(result, { status: "timeout", closedAfterKill: false });
+  assert.equal(killed, true);
+  assert.equal(unrefed, true);
+});
+
+for (const status of ["spawn_error", "nonzero", "timeout"]) {
+  test(`Windows routed restart rejects wrapper exit after ${status} tree cleanup`, async () => {
+    await assert.rejects(
+      restartManagedChild(
+        { pid: 4242 },
+        Promise.resolve({ code: 1, signal: null }),
+        {
+          command: "fake-codex.cmd",
+          platform: "win32",
+          environment: { Path: "C:\\Windows\\System32" },
+          cleanupProcessTree: async () => ({ status }),
+        },
+      ),
+      new RegExp(`process-tree cleanup failed \\(${status}\\)`),
+    );
+  });
 }
 
 test("managed identity persists a fresh session for a later Codex resume", async () => {

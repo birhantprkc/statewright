@@ -44,6 +44,10 @@ test("plugin release workflow resolves distinct names and curated notes", async 
     resolve(root, ".github/workflows/windows-plugin-canary.yml"),
     "utf8",
   );
+  const windowsRouteCanary = await readFile(
+    resolve(root, "plugins/executor/tests/windows-managed-client-route-canary.mjs"),
+    "utf8",
+  );
   const codexManifest = JSON.parse(
     await readFile(resolve(root, "plugins/codex/.codex-plugin/plugin.json"), "utf8"),
   );
@@ -65,6 +69,9 @@ test("plugin release workflow resolves distinct names and curated notes", async 
   assert.match(workflow, /require\("\.\/\.github\/scripts\/require-plugin-canaries\.cjs"\)/);
   assert.match(workflow, /await requirePluginCanaries\(/);
   assert.match(windowsCanary, /push:\n\s+branches: \[main\]/);
+  assert.match(windowsCanary, /name: Run managed-client bootstrap and route canaries\n\s+timeout-minutes: 3/);
+  assert.match(windowsRouteCanary, /codex-root-session\.json/);
+  assert.match(windowsRouteCanary, /root_session_id: "windows-route-session"/);
 });
 
 test("release gate accepts successful exact-commit hosted canaries", async () => {

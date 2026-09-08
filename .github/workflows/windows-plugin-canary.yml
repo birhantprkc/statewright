@@ -45,6 +45,7 @@ jobs:
           "Codex command: $((Get-Command codex).Source)"
           "Claude command: $((Get-Command claude).Source)"
       - name: Run managed-client bootstrap and route canaries
+        timeout-minutes: 3
         run: |
           node plugins/executor/tests/windows-managed-client-canary.mjs
           node plugins/executor/tests/windows-managed-client-route-canary.mjs

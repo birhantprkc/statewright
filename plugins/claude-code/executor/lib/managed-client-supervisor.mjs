@@ -26,6 +26,15 @@ const PARENT_MANAGED_IDENTITY_ENV = [
   "STATEWRIGHT_MANAGED_MCP_TOKEN",
   "STATEWRIGHT_MANAGED_TELEMETRY_OWNER",
 ];
+const WINDOWS_PROCESS_TREE_ENV = new Set([
+  "comspec",
+  "path",
+  "pathext",
+  "systemroot",
+  "temp",
+  "tmp",
+  "windir",
+]);
 
 export function managedClientChildEnvironment({ host, environment = process.env, overrides = {} }) {
   const childEnvironment = { ...environment };
@@ -252,11 +261,45 @@ async function resolveWindowsCmdShim(command, platform = process.platform) {
   };
 }
 
-function signalChildGroup(child, signal, { platform = process.platform, spawnImpl = spawn } = {}) {
+export function windowsProcessTreeEnvironment(environment = process.env) {
+  return Object.fromEntries(
+    Object.entries(environment).filter(([key]) => WINDOWS_PROCESS_TREE_ENV.has(key.toLowerCase())),
+  );
+}
+
+export async function terminateWindowsProcessTree(child, {
+  environment = process.env,
+  spawnImpl = spawn,
+  timeoutMs = 1_500,
+  closeGraceMs = 500,
+} = {}) {
+  if (!child.pid) return { status: "missing_pid" };
+  let taskkill;
+  try {
+    taskkill = spawnImpl("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+      env: windowsProcessTreeEnvironment(environment),
+      stdio: "ignore",
+      windowsHide: true,
+    });
+  } catch (error) {
+    return { status: "spawn_error", errorCode: error?.code ?? "unknown" };
+  }
+  const completion = new Promise((resolveCompletion) => {
+    taskkill.once?.("error", (error) => resolveCompletion({ status: "spawn_error", errorCode: error?.code ?? "unknown" }));
+    taskkill.once?.("close", (code, signal) => resolveCompletion({ status: code === 0 ? "success" : "nonzero", code, signal }));
+  });
+  if (await waitForChildExit(completion, timeoutMs)) return completion;
+  try { taskkill.kill?.(); } catch { /* cleanup process already exited */ }
+  const closedAfterKill = await waitForChildExit(completion, closeGraceMs);
+  if (!closedAfterKill) taskkill.unref?.();
+  return { status: "timeout", closedAfterKill };
+}
+
+async function signalChildGroup(child, signal, { platform = process.platform, spawnImpl = spawn, environment = process.env } = {}) {
   if (!windowsPlatform(platform) && child.pid) {
     try {
       process.kill(-child.pid, signal);
-      return;
+      return { status: "group_signal_sent" };
     } catch {
       // The child exited or the host does not permit process-group signals.
     }
@@ -265,15 +308,10 @@ function signalChildGroup(child, signal, { platform = process.platform, spawnImp
     // A managed .cmd launcher owns a cmd.exe child. Killing only that wrapper
     // leaves the real CLI process behind, so escalate through taskkill's tree
     // semantics after the initial graceful SIGINT attempt.
-    const taskkill = spawnImpl("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
-    taskkill.once?.("error", () => {});
-    taskkill.unref?.();
-    return;
+    return terminateWindowsProcessTree(child, { environment, spawnImpl });
   }
   child.kill(signal);
+  return { status: "child_signal_sent" };
 }
 
 function waitForChildExit(exit, milliseconds) {
@@ -290,18 +328,29 @@ function waitForChildExit(exit, milliseconds) {
   });
 }
 
-async function restartManagedChild(child, exit, { command, platform = process.platform } = {}) {
+export async function restartManagedChild(child, exit, {
+  command,
+  platform = process.platform,
+  environment = process.env,
+  spawnImpl = spawn,
+  cleanupProcessTree = terminateWindowsProcessTree,
+} = {}) {
   // SIGINT against cmd.exe can terminate the wrapper while leaving its CLI
   // child running. Terminate the tree first and await it before the next
   // routed launch so the old process cannot retain the control directory.
   if (isWindowsCommand(command, platform)) {
-    signalChildGroup(child, "SIGTERM", { platform });
-    await waitForChildExit(exit, 1_500);
+    const cleanup = await cleanupProcessTree(child, { environment, spawnImpl });
+    if (cleanup.status !== "success") {
+      throw new Error(`Windows managed-client process-tree cleanup failed (${cleanup.status}).`);
+    }
+    if (!await waitForChildExit(exit, 1_500)) {
+      throw new Error("Windows managed client remained active after successful process-tree cleanup.");
+    }
     return;
   }
-  signalChildGroup(child, "SIGINT", { platform });
+  await signalChildGroup(child, "SIGINT", { platform, environment });
   if (await waitForChildExit(exit, 1_500)) return;
-  signalChildGroup(child, "SIGTERM", { platform });
+  await signalChildGroup(child, "SIGTERM", { platform, environment });
   await waitForChildExit(exit, 1_500);
 }
 
@@ -351,17 +400,17 @@ export function codexOneShotInvocation(host, args) {
   return false;
 }
 
-function forwardManagedTermination(child, exit, { command, platform = process.platform } = {}) {
+function forwardManagedTermination(child, exit, { command, platform = process.platform, environment = process.env } = {}) {
   let termination = null;
   const forward = (signal) => {
     termination ??= (async () => {
       if (isWindowsCommand(command, platform)) {
-        signalChildGroup(child, "SIGTERM", { platform });
+        await signalChildGroup(child, "SIGTERM", { platform, environment });
       } else {
-        signalChildGroup(child, signal, { platform });
+        await signalChildGroup(child, signal, { platform, environment });
       }
       if (await waitForChildExit(exit, 1_500)) return;
-      signalChildGroup(child, "SIGTERM", { platform });
+      await signalChildGroup(child, "SIGTERM", { platform, environment });
       await waitForChildExit(exit, 1_500);
     })();
   };
@@ -533,20 +582,21 @@ export async function runManagedClient({ host, command, args, environment = proc
         const residentRoutes = residentControlDir(home, routedClientId);
         await resetCodexRootSession(residentRoutes, { sessionId: codexRootSessionId, clientId: routedClientId });
         const residentArgs = [...args, "--remote", resident.proxyUrl];
+        const tuiEnvironment = {
+          ...isolatedEnvironment,
+          STATEWRIGHT_ROUTE_CONTROL_DIR: residentRoutes,
+          STATEWRIGHT_MANAGED_CLIENT_HOST: host,
+          STATEWRIGHT_CLIENT_ID: routedClientId,
+          ...(codexRootSessionId ? { STATEWRIGHT_MANAGED_CODEX_ROOT_SESSION_ID: codexRootSessionId } : {}),
+          STATEWRIGHT_MANAGED_TELEMETRY_OWNER: telemetry ? "supervisor" : "none",
+        };
         const tui = spawn(command, residentArgs, {
           cwd,
-          env: {
-            ...isolatedEnvironment,
-            STATEWRIGHT_ROUTE_CONTROL_DIR: residentRoutes,
-            STATEWRIGHT_MANAGED_CLIENT_HOST: host,
-            STATEWRIGHT_CLIENT_ID: routedClientId,
-            ...(codexRootSessionId ? { STATEWRIGHT_MANAGED_CODEX_ROOT_SESSION_ID: codexRootSessionId } : {}),
-            STATEWRIGHT_MANAGED_TELEMETRY_OWNER: telemetry ? "supervisor" : "none",
-          },
+          env: tuiEnvironment,
           stdio: "inherit",
         });
         const tuiExit = waitForExit(tui);
-        const stopForwarding = forwardManagedTermination(tui, tuiExit, { command });
+        const stopForwarding = forwardManagedTermination(tui, tuiExit, { command, environment: tuiEnvironment });
         try {
           const result = await tuiExit;
           if (!isExpectedExit(result)) await reporter.report(new Error("Native Codex connected to its resident App Server exited unexpectedly."), {
@@ -595,7 +645,7 @@ export async function runManagedClient({ host, command, args, environment = proc
       let restart = false;
       child.once("exit", () => { exited = true; });
       const exit = waitForExit(child);
-      const stopForwarding = forwardManagedTermination(child, exit, { command: launchCommand });
+      const stopForwarding = forwardManagedTermination(child, exit, { command: launchCommand, environment: childEnvironment });
       try {
         if (oneShotCodexExec) {
           const result = await exit;
@@ -639,7 +689,7 @@ export async function runManagedClient({ host, command, args, environment = proc
             if (!request.model) continue;
             nextArgs = buildRoutedArgs({ host, originalArgs: args, request });
             restart = true;
-            await restartManagedChild(child, exit, { command: launchCommand });
+            await restartManagedChild(child, exit, { command: launchCommand, environment: childEnvironment });
             break;
           }
           await delay(pollMs);
