@@ -1,9 +1,49 @@
 "use strict";
 
+const UNIX_PLUGINS = Object.freeze(["codex", "claude", "cursor", "pi", "opencode", "omx"]);
+const UNIX_OPERATING_SYSTEMS = Object.freeze(["ubuntu-24.04", "macos-14"]);
+const WINDOWS_JOB = "Codex and Claude managed-client bootstrap";
+const WINDOWS_PRODUCTION_STEP = "Run authenticated production gateway canary";
+
 const REQUIRED_WORKFLOWS = Object.freeze([
-  { workflowId: "plugin-production-canary.yml", label: "macOS/Linux production matrix" },
-  { workflowId: "windows-plugin-canary.yml", label: "Windows bootstrap" },
+  {
+    workflowId: "plugin-production-canary.yml",
+    label: "macOS/Linux production matrix",
+    requiredJobs: UNIX_PLUGINS.flatMap((plugin) =>
+      UNIX_OPERATING_SYSTEMS.map((operatingSystem) => `${plugin} on ${operatingSystem}`)),
+  },
+  {
+    workflowId: "windows-plugin-canary.yml",
+    label: "Windows production/bootstrap",
+    requiredJobs: [WINDOWS_JOB],
+    requiredSteps: [{ job: WINDOWS_JOB, step: WINDOWS_PRODUCTION_STEP }],
+  },
 ]);
+
+async function requireWorkflowJobs({ github, context, requirement, run }) {
+  const { data } = await github.rest.actions.listJobsForWorkflowRun({
+    owner: context.repo.owner,
+    repo: context.repo.repo,
+    run_id: run.id,
+    per_page: 100,
+  });
+  const jobs = data.jobs ?? [];
+  for (const jobName of requirement.requiredJobs) {
+    const job = jobs.find((candidate) => candidate.name === jobName);
+    if (!job || job.conclusion !== "success") {
+      throw new Error(`${requirement.label} run ${run.id} lacks successful job ${jobName}.`);
+    }
+  }
+  for (const required of requirement.requiredSteps ?? []) {
+    const job = jobs.find((candidate) => candidate.name === required.job);
+    const step = job?.steps?.find((candidate) => candidate.name === required.step);
+    if (!step || step.conclusion !== "success") {
+      throw new Error(
+        `${requirement.label} run ${run.id} lacks successful step ${required.step} in ${required.job}.`,
+      );
+    }
+  }
+}
 
 async function requirePluginCanaries({ github, context, core, sourceSha }) {
   if (!sourceSha) throw new Error("Release source SHA is required.");
@@ -26,11 +66,26 @@ async function requirePluginCanaries({ github, context, core, sourceSha }) {
       status: "completed",
       per_page: 100,
     });
-    const passed = data.workflow_runs.find((run) =>
-      run.conclusion === "success"
-      && (run.event === "push" || run.event === "workflow_dispatch"));
+    const candidates = data.workflow_runs.filter((run) =>
+      run.conclusion === "success" && run.event === "push");
+    if (candidates.length === 0) {
+      throw new Error(`${requirement.label} has no successful trusted push run for ${sourceSha}.`);
+    }
+    let passed;
+    let lastError;
+    for (const candidate of candidates) {
+      try {
+        await requireWorkflowJobs({ github, context, requirement, run: candidate });
+        passed = candidate;
+        break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
     if (!passed) {
-      throw new Error(`${requirement.label} has no successful run for ${sourceSha}.`);
+      throw new Error(
+        `${requirement.label} has no complete successful trusted push run for ${sourceSha}: ${lastError?.message}`,
+      );
     }
     core.info(`${requirement.label}: ${passed.html_url}`);
     evidence.push({ workflowId: requirement.workflowId, runId: passed.id, url: passed.html_url });

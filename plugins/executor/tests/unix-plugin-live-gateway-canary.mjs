@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import readline from "node:readline";
 
@@ -10,21 +11,27 @@ if (process.platform === "win32") {
 }
 
 const plugin = process.argv[2];
+const repositoryRoot = resolve(import.meta.dirname, "../../..");
+const pluginRoot = resolve(process.env.STATEWRIGHT_PLUGIN_ROOT?.trim() || repositoryRoot);
 const proxyByPlugin = {
   codex: "plugins/codex/mcp-proxy.sh",
   claude: "plugins/claude-code/mcp-proxy.sh",
   cursor: "plugins/cursor/mcp-proxy.sh",
 };
-const proxy = proxyByPlugin[plugin];
+const proxyPath = proxyByPlugin[plugin];
 const apiKey = process.env.STATEWRIGHT_API_KEY?.trim();
 const gatewayUrl = process.env.STATEWRIGHT_GATEWAY_URL?.trim();
 
-if (!proxy) throw new Error("Usage: unix-plugin-live-gateway-canary.mjs <codex|claude|cursor>");
+if (!proxyPath) throw new Error("Usage: unix-plugin-live-gateway-canary.mjs <codex|claude|cursor>");
 if (!apiKey || !gatewayUrl) {
   throw new Error("STATEWRIGHT_API_KEY and STATEWRIGHT_GATEWAY_URL are required for the live gateway canary.");
 }
+const proxy = resolve(pluginRoot, proxyPath);
+if (!existsSync(proxy)) {
+  throw new Error(`${plugin} proxy is missing from plugin root ${pluginRoot}.`);
+}
 
-const child = spawn("bash", [resolve(proxy)], {
+const child = spawn("bash", [proxy], {
   env: {
     ...process.env,
     STATEWRIGHT_API_KEY: apiKey,
@@ -74,7 +81,15 @@ try {
   });
   assert.equal(initialized.error, undefined, `${plugin} proxy rejected initialize.`);
 
-  const status = await call(2, "tools/call", {
+  const tools = await call(2, "tools/list", {});
+  assert.equal(tools.error, undefined, `${plugin} proxy rejected tools/list.`);
+  assert.equal(
+    tools.result?.tools?.some((tool) => tool.name === "statewright_get_status"),
+    true,
+    `${plugin} proxy did not expose statewright_get_status.`,
+  );
+
+  const status = await call(3, "tools/call", {
     name: "statewright_get_status",
     arguments: {},
   });

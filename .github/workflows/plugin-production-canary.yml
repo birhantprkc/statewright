@@ -2,6 +2,25 @@ name: Plugin Production Canary
 
 on:
   workflow_dispatch:
+    inputs:
+      release_ref:
+        description: "Trusted main commit or tag to exercise"
+        required: true
+        default: "main"
+        type: string
+      plugin:
+        description: "Plugin transport to exercise"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - codex
+          - claude
+          - cursor
+          - pi
+          - opencode
+          - omx
   push:
     branches: [main]
     paths:
@@ -31,9 +50,21 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-14]
-        plugin: [codex, claude, cursor, pi, opencode, omx]
+        plugin: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.plugin != 'all' && format('["{0}"]', inputs.plugin) || '["codex","claude","cursor","pi","opencode","omx"]') }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_ref || github.sha }}
+      - name: Require source from trusted main history
+        run: |
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "The selected release_ref is not part of trusted main history." >&2
+            exit 1
+          }
+      - name: Resolve canary source identity
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -72,11 +103,16 @@ jobs:
           esac
       - name: Record verification boundary
         if: always()
+        env:
+          REQUESTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.release_ref || github.ref_name }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## Plugin production canary boundary
-
-          This trusted-run-only job authenticates a dedicated isolated canary account to `mcp.statewright.ai`, then exercises a non-mutating MCP initialization and `statewright_get_status` request through each plugin's production transport. Codex, Claude Code, and Cursor use their actual stdio MCP proxies. Pi and standalone OMX use their direct gateway clients. OpenCode uses its executor-owned adapter bridge.
-
-          The secret is step-scoped and this workflow has no pull-request trigger. This proves plugin-to-gateway compatibility on macOS and Linux. It does not claim an authenticated interactive vendor Codex, Claude, Pi, OpenCode, Cursor, or OMX session.
-          EOF
+          {
+            printf '%s\n' '## Plugin production canary boundary' ''
+            printf -- '- Plugin: `%s`\n' '${{ matrix.plugin }}'
+            printf -- '- Runner: `%s`\n' '${{ matrix.os }}'
+            printf -- '- Requested ref: `%s`\n' "$REQUESTED_REF"
+            printf -- '- Resolved source SHA: `%s`\n\n' "$SOURCE_SHA"
+            printf '%s\n' 'This trusted-run-only job authenticates a dedicated isolated canary account to `mcp.statewright.ai`. Codex, Claude Code, and Cursor exercise MCP initialization, `tools/list`, and `statewright_get_status` through their actual stdio proxies. Pi and standalone OMX exercise initialization plus `statewright_get_status` through their direct clients. OpenCode relays `statewright_get_status` through its initialized executor-owned adapter bridge.' ''
+            printf '%s\n' 'The secret is step-scoped and this workflow has no pull-request trigger. The selected source must resolve inside trusted `main` history before the secret-bearing step runs. This proves source-transport compatibility on macOS and Linux; it does not claim a packaged artifact or authenticated interactive vendor session.'
+          } >> "$GITHUB_STEP_SUMMARY"

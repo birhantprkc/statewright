@@ -44,7 +44,13 @@ try {
     capabilities: {},
     clientInfo: { name: "statewright-windows-canary", version: "1" },
   });
-  await callMcp(bridge, bridge.token, 2, "tools/call", {
+  const tools = await callMcp(bridge, bridge.token, 2, "tools/list", {});
+  assert.equal(
+    tools.tools?.some((tool) => tool.name === "statewright_get_status"),
+    true,
+    "managed bridge did not expose statewright_get_status",
+  );
+  await callMcp(bridge, bridge.token, 3, "tools/call", {
     name: "statewright_get_status",
     arguments: {},
   });

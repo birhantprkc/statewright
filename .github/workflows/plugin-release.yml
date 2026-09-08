@@ -8,11 +8,24 @@ on:
 
 permissions:
   actions: read
-  contents: write
+  contents: read
 
 jobs:
   package:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      archive: ${{ steps.plugin.outputs.archive }}
+      directory: ${{ steps.plugin.outputs.directory }}
+      notes_path: ${{ steps.plugin.outputs.notes_path }}
+      plugin: ${{ steps.plugin.outputs.plugin }}
+      release_name: ${{ steps.plugin.outputs.release_name }}
+      source_sha: ${{ steps.source.outputs.sha }}
+      version: ${{ steps.plugin.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - name: Resolve release source commit
@@ -38,17 +51,19 @@ jobs:
         run: |
           case "$TAG" in
             codex-v*)
-              echo 'directory=plugins/codex' >> "$GITHUB_OUTPUT"
-              echo 'artifact=statewright-codex' >> "$GITHUB_OUTPUT"
               raw=${TAG#codex-v}; version=${raw%%-r*}
+              echo 'plugin=codex' >> "$GITHUB_OUTPUT"
+              echo 'directory=plugins/codex' >> "$GITHUB_OUTPUT"
+              echo "archive=statewright-codex-$version.zip" >> "$GITHUB_OUTPUT"
               echo "version=$version" >> "$GITHUB_OUTPUT"
               echo "release_name=Statewright Codex plugin $version" >> "$GITHUB_OUTPUT"
               echo "notes_path=docs/releases/$version.md" >> "$GITHUB_OUTPUT"
               ;;
             claude-v*)
-              echo 'directory=plugins/claude-code' >> "$GITHUB_OUTPUT"
-              echo 'artifact=statewright-claude-code' >> "$GITHUB_OUTPUT"
               raw=${TAG#claude-v}; version=${raw%%-r*}
+              echo 'plugin=claude' >> "$GITHUB_OUTPUT"
+              echo 'directory=plugins/claude-code' >> "$GITHUB_OUTPUT"
+              echo "archive=statewright-claude-code-$version.zip" >> "$GITHUB_OUTPUT"
               echo "version=$version" >> "$GITHUB_OUTPUT"
               echo "release_name=Statewright Claude Code plugin $version" >> "$GITHUB_OUTPUT"
               echo "notes_path=docs/releases/$version.md" >> "$GITHUB_OUTPUT"
@@ -89,15 +104,93 @@ jobs:
           fi
       - name: Package plugin
         env:
+          ARCHIVE: ${{ steps.plugin.outputs.archive }}
           DIRECTORY: ${{ steps.plugin.outputs.directory }}
-          ARTIFACT: ${{ steps.plugin.outputs.artifact }}
-          VERSION: ${{ steps.plugin.outputs.version }}
         run: |
           cp plugins/LICENSE.md "$DIRECTORY/LICENSE.md"
-          zip -r "$ARTIFACT-$VERSION.zip" "$DIRECTORY" -x '*/node_modules/*' '*/.DS_Store'
+          zip -r "$ARCHIVE" "$DIRECTORY" -x '*/node_modules/*' '*/.DS_Store'
+      - name: Attest release candidate provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.plugin.outputs.archive }}
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-release-candidate
+          path: ${{ steps.plugin.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 1
+
+  artifact-smoke:
+    needs: package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugins/executor/package-lock.json
+      - name: Install canary runner dependencies
+        run: npm ci --ignore-scripts --prefix plugins/executor
+      - name: Download release candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-release-candidate
+          path: ${{ runner.temp }}/release
+      - name: Unpack release candidate
+        id: candidate
+        env:
+          ARCHIVE: ${{ needs.package.outputs.archive }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/plugin-candidate"
+          unzip -q "$RUNNER_TEMP/release/$ARCHIVE" -d "$RUNNER_TEMP/plugin-candidate"
+          digest=$(shasum -a 256 "$RUNNER_TEMP/release/$ARCHIVE" | awk '{print $1}')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Smoke packaged plugin against production
+        env:
+          STATEWRIGHT_API_KEY: ${{ secrets.STATEWRIGHT_PLUGIN_CANARY_API_KEY }}
+          STATEWRIGHT_GATEWAY_URL: https://mcp.statewright.ai
+          STATEWRIGHT_PLUGIN_PRODUCTION_CANARY: "1"
+          STATEWRIGHT_NO_UPDATE_CHECK: "1"
+          STATEWRIGHT_PLUGIN_ROOT: ${{ runner.temp }}/plugin-candidate
+        run: |
+          test -n "$STATEWRIGHT_API_KEY" || { echo "STATEWRIGHT_PLUGIN_CANARY_API_KEY is required." >&2; exit 1; }
+          node plugins/executor/tests/unix-plugin-live-gateway-canary.mjs "${{ needs.package.outputs.plugin }}"
+      - name: Record packaged-artifact evidence
+        if: always()
+        env:
+          ARCHIVE: ${{ needs.package.outputs.archive }}
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+          SOURCE_SHA: ${{ needs.package.outputs.source_sha }}
+        run: |
+          {
+            printf '%s\n' '## Packaged plugin production smoke' ''
+            printf -- '- Archive: `%s`\n' "$ARCHIVE"
+            printf -- '- SHA-256: `%s`\n' "$DIGEST"
+            printf -- '- Source SHA: `%s`\n' "$SOURCE_SHA"
+            printf -- '- Runner: `%s`\n' '${{ matrix.os }}'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: [package, artifact-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download verified release candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-release-candidate
       - name: Publish plugin release
         uses: softprops/action-gh-release@v2
         with:
-          name: "${{ steps.plugin.outputs.release_name }}"
-          body_path: "${{ steps.plugin.outputs.notes_path }}"
-          files: "${{ steps.plugin.outputs.artifact }}-${{ steps.plugin.outputs.version }}.zip"
+          name: "${{ needs.package.outputs.release_name }}"
+          body_path: "${{ needs.package.outputs.notes_path }}"
+          files: "${{ needs.package.outputs.archive }}"

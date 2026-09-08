@@ -68,6 +68,27 @@ tasks:
       - npm test --prefix plugins/opencode -- --run src/production-gateway-canary.test.ts
       - npm test --prefix plugins/omx -- --run src/production-gateway-canary.test.ts
 
+  canary:plugin-version:
+    desc: "Dispatch a macOS/Linux source or release-artifact production canary at an explicit trusted ref"
+    requires:
+      vars: [REF, PLUGIN]
+    vars:
+      MODE: '{{default "source" .MODE}}'
+    preconditions:
+      - sh: 'printf "%s" "{{.PLUGIN}}" | grep -Eq "^(codex|claude|cursor|pi|opencode|omx)$"'
+        msg: "PLUGIN must be codex, claude, cursor, pi, opencode, or omx"
+      - sh: 'printf "%s" "{{.MODE}}" | grep -Eq "^(source|release-artifact)$"'
+        msg: "MODE must be source or release-artifact"
+    cmds:
+      - gh workflow run plugin-version-canary.yml --ref main -f release_ref="{{.REF}}" -f plugin="{{.PLUGIN}}" -f evidence_mode="{{.MODE}}"
+
+  canary:plugin-version:windows:
+    desc: "Dispatch the Windows managed-client and production canary at an explicit trusted ref"
+    requires:
+      vars: [REF]
+    cmds:
+      - gh workflow run windows-plugin-canary.yml --ref main -f release_ref="{{.REF}}"
+
   test:claude-routing:
     desc: "Run Claude managed-proxy and loopback bridge routing tests"
     cmds:
