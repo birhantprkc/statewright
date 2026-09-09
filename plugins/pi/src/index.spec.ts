@@ -232,6 +232,18 @@ function setupFetch(responses: Array<{ match: string; body: unknown; headers?: R
 // --- Tests ---
 
 describe("isolated delivery capability", () => {
+  beforeEach(() => {
+    process.env.STATEWRIGHT_API_KEY = API_KEY
+    process.env.STATEWRIGHT_GATEWAY_URL = "http://localhost:3001"
+    process.env.STATEWRIGHT_WORKFLOW = "test-workflow"
+  })
+
+  afterEach(() => {
+    delete process.env.STATEWRIGHT_API_KEY
+    delete process.env.STATEWRIGHT_GATEWAY_URL
+    delete process.env.STATEWRIGHT_WORKFLOW
+  })
+
   it("detects any required delivery policy", () => {
     expect(requiresDeliveryOwner({ workspace: { required: true } })).toBe(true)
     expect(requiresDeliveryOwner({ preview: { required: true } })).toBe(true)
