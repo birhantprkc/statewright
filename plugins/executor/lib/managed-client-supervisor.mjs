@@ -604,7 +604,8 @@ export async function runManagedClient({ host, command, args, environment = proc
         mode: codexHistoryRepairMode({ environment, config }),
       });
       if (historyResult?.status === "repaired") {
-        process.stderr.write(`[statewright] backed up and repaired ${historyResult.droppedRecords} duplicate Codex restart metadata record(s); rebuilding this thread's derived history projection.\n`);
+        if (historyResult.repairKind === "stale_rollout_pointer") process.stderr.write(`[statewright] backed up the Codex state database and restored this thread's canonical rollout pointer.\n`);
+        else process.stderr.write(`[statewright] backed up and repaired ${historyResult.droppedRecords} duplicate Codex restart metadata record(s); rebuilding this thread's derived history projection.\n`);
       }
       return historyResult;
     };

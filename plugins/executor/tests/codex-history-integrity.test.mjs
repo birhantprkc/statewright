@@ -515,3 +515,55 @@ test("repair aborts before backup or mutation for any unknown ordinal anomaly", 
     await assert.rejects(access(backupRoot));
   } finally { await rm(home, { recursive: true, force: true }); }
 });
+
+test("repair relinks an exact stale managed App Server pointer after backing up Codex state", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-pointer-"));
+  try {
+    const canonical = await writeRollout(home, [
+      legacyRecord("session_meta", { id: SESSION_ID, history_mode: "legacy" }),
+      legacyRecord("event_msg", { type: "task_complete" }),
+    ]);
+    const databasePath = join(home, ".codex", "state_5.sqlite");
+    const stale = join(tmpdir(), `statewright-swc_${"a".repeat(32)}-app-server-dead`, "sessions", "2026", "08", "30", `rollout-2026-08-30T00-00-00-${SESSION_ID}.jsonl`);
+    const database = new DatabaseSync(databasePath);
+    database.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)");
+    database.prepare("INSERT INTO threads VALUES (?, ?)").run(SESSION_ID, stale);
+    database.close();
+    const result = await guardCodexResumeHistory({
+      home, sessionId: SESSION_ID, mode: "repair", environment: codexTestEnvironment(),
+    });
+    assert.equal(result.repairKind, "stale_rollout_pointer");
+    const repaired = new DatabaseSync(databasePath, { readOnly: true });
+    assert.equal(repaired.prepare("SELECT rollout_path FROM threads WHERE id = ?").get(SESSION_ID).rollout_path, canonical);
+    repaired.close();
+    const backups = await readdir(join(home, ".codex", "backups"));
+    assert.equal(backups.length, 1);
+    assert.ok((await readdir(join(home, ".codex", "backups", backups[0]))).includes("state_5.sqlite"));
+    const manifest = JSON.parse(await readFile(join(home, ".codex", "backups", backups[0], "manifest.json"), "utf8"));
+    assert.match(manifest.target_scoped_rollback_sql, /UPDATE threads SET rollout_path/);
+    assert.match(manifest.rollback, /whole database is disaster recovery only/);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("stale pointer repair never falls through to an obsolete Codex state database", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-pointer-version-"));
+  try {
+    await writeRollout(home, [
+      legacyRecord("session_meta", { id: SESSION_ID, history_mode: "legacy" }),
+      legacyRecord("event_msg", { type: "task_complete" }),
+    ]);
+    const stale = join(tmpdir(), `statewright-swc_${"b".repeat(32)}-app-server-dead`, "sessions", "2026", "08", "30", `rollout-2026-08-30T00-00-00-${SESSION_ID}.jsonl`);
+    const oldDatabase = new DatabaseSync(join(home, ".codex", "state_4.sqlite"));
+    oldDatabase.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)");
+    oldDatabase.prepare("INSERT INTO threads VALUES (?, ?)").run(SESSION_ID, stale);
+    oldDatabase.close();
+    const currentDatabase = new DatabaseSync(join(home, ".codex", "state_5.sqlite"));
+    currentDatabase.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)");
+    currentDatabase.close();
+    const result = await guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "repair", environment: codexTestEnvironment() });
+    assert.notEqual(result.repairKind, "stale_rollout_pointer");
+    const unchanged = new DatabaseSync(join(home, ".codex", "state_4.sqlite"), { readOnly: true });
+    assert.equal(unchanged.prepare("SELECT rollout_path FROM threads WHERE id = ?").get(SESSION_ID).rollout_path, stale);
+    unchanged.close();
+  } finally { await rm(home, { recursive: true, force: true }); }
+});

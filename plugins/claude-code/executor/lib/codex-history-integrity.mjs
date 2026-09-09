@@ -581,6 +581,80 @@ async function repairPartialWrite({ path, sessionId, backupRoot }) {
   return { status: "repaired", repairKind: "partial_write", backupPath, finalOrdinal: rows.at(-1).ordinal };
 }
 
+function statewrightAppServerRolloutPath(path) {
+  return typeof path === "string"
+    && /(?:^|[\\/])statewright-swc_[a-f0-9]{32}-app-server-[^\\/]+[\\/]sessions[\\/]/.test(path);
+}
+
+async function staleThreadPointer({ storage, sessionId }) {
+  const candidates = [];
+  const directory = await opendir(storage.sqliteHome).catch(() => null);
+  if (!directory) return null;
+  for await (const entry of directory) {
+    const match = entry.isFile() && entry.name.match(/^state_(\d+)\.sqlite$/);
+    if (match) candidates.push({ path: join(storage.sqliteHome, entry.name), version: Number(match[1]) });
+  }
+  candidates.sort((left, right) => right.version - left.version);
+  const candidate = candidates[0];
+  if (!candidate) return null;
+  const canonicalPath = await findCodexRollout({ codexHome: storage.codexHome, sessionId });
+  if (!canonicalPath) return null;
+  const sqlite = await openProjection();
+  const database = new sqlite.DatabaseSync(candidate.path, { readOnly: true });
+  try {
+    const row = database.prepare("SELECT rollout_path FROM threads WHERE id = ?").get(sessionId);
+    const recordedPath = row?.rollout_path;
+    if (!recordedPath || await pathExists(recordedPath)) return null;
+    if (!statewrightAppServerRolloutPath(recordedPath) || basename(recordedPath) !== basename(canonicalPath)) return null;
+    return { databasePath: candidate.path, recordedPath, canonicalPath };
+  } catch (error) {
+    if (/no such table: threads/.test(String(error?.message))) return null;
+    throw error;
+  } finally { database.close(); }
+}
+
+async function repairStaleThreadPointer({ pointer, sessionId, backupRoot }) {
+  const stamp = new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
+  const backupRootExisted = await pathExists(backupRoot);
+  await mkdir(backupRoot, { recursive: true, mode: 0o700 });
+  if (!backupRootExisted) await syncDirectory(dirname(backupRoot));
+  const backupDir = join(backupRoot, `statewright-codex-pointer-${stamp}-${sessionId.slice(0, 8)}`);
+  await mkdir(backupDir, { recursive: false, mode: 0o700 });
+  await syncDirectory(backupRoot);
+  const backupPath = join(backupDir, basename(pointer.databasePath));
+  const manifestPath = join(backupDir, "manifest.json");
+  const sqlite = await openProjection();
+  const source = new sqlite.DatabaseSync(pointer.databasePath, { readOnly: true });
+  try {
+    if (!projectionIntegrity(source)) throw new Error("Codex state database integrity check failed");
+    await sqlite.backup(source, backupPath);
+  } finally { source.close(); }
+  await chmod(backupPath, 0o600);
+  await syncFile(backupPath);
+  await syncDirectory(backupDir);
+  const database = new sqlite.DatabaseSync(pointer.databasePath);
+  try {
+    database.exec("BEGIN IMMEDIATE");
+    const result = database.prepare("UPDATE threads SET rollout_path = ? WHERE id = ? AND rollout_path = ?")
+      .run(pointer.canonicalPath, sessionId, pointer.recordedPath);
+    if (Number(result.changes) !== 1) throw new Error("stale rollout pointer changed before repair");
+    if (!projectionIntegrity(database)) throw new Error("Codex state database integrity check failed after repair");
+    database.exec("COMMIT");
+  } catch (error) {
+    try { database.exec("ROLLBACK"); } catch {}
+    throw error;
+  } finally { database.close(); }
+  await writeJsonAtomic(manifestPath, {
+    version: 1, state: "completed", completed_at: new Date().toISOString(), thread_id: sessionId,
+    database_path: pointer.databasePath, database_backup: backupPath,
+    stale_rollout_path: pointer.recordedPath, canonical_rollout_path: pointer.canonicalPath,
+    target_scoped_rollback_sql: `BEGIN IMMEDIATE; UPDATE threads SET rollout_path = ${sqlLiteral(pointer.recordedPath)} WHERE id = ${sqlLiteral(sessionId)} AND rollout_path = ${sqlLiteral(pointer.canonicalPath)}; COMMIT;`,
+    disaster_recovery_database_backup: backupPath,
+    rollback: "Stop writers and apply target_scoped_rollback_sql. Restoring the whole database is disaster recovery only and can rewind unrelated threads.",
+  });
+  return { status: "repaired", repairKind: "stale_rollout_pointer", backupDir, canonicalPath: pointer.canonicalPath };
+}
+
 export async function guardCodexResumeHistory({
   home = homedir(), cwd = process.cwd(), args = [], sessionId, mode = "guard", backupRoot = null,
   environment = process.env, withWriterLock = withCodexWriterLock, repairOperations = {},
@@ -591,25 +665,36 @@ export async function guardCodexResumeHistory({
     if (!REPAIR_MODES.has(mode)) mode = "guard";
     const storage = await resolveCodexHistoryStorage({ home, cwd, environment, args });
     const effectiveBackupRoot = backupRoot ?? join(storage.codexHome, "backups");
-    const inspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
+    let inspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
     if (inspection.status === "unsafe" && mode === "prompt" && inspection.unknownAnomalies.some((item) => item.kind === "malformed_json")) {
       if (!process.stdin.isTTY || !process.stderr.isTTY) throw new CodexHistoryIntegrityError("Statewright detected a recoverable-looking partial Codex write but cannot prompt on a non-interactive terminal. Re-run interactively to approve repair.", { code: "CODEX_HISTORY_REPAIR_PROMPT_REQUIRED", inspection });
       process.stderr.write("[statewright] Codex history contains a recoverable-looking partial write. Back up and repair this session? [y/N] ");
       const answer = await new Promise((resolve) => process.stdin.once("data", (chunk) => resolve(String(chunk).trim().toLowerCase())));
       if (answer === "y" || answer === "yes") {
         const repaired = await repairPartialWrite({ path: inspection.path, sessionId, backupRoot: effectiveBackupRoot });
-        if (repaired) return repaired;
+        if (repaired) inspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
       }
     }
-    const classified = classifyInspection(inspection);
-    if (classified) return classified;
-    if (mode === "guard") throw new CodexHistoryIntegrityError(`Statewright detected duplicate restart metadata and is refusing to resume from a stale paginated projection. Re-run once with STATEWRIGHT_CODEX_HISTORY_REPAIR=auto after exiting every writer for this thread. If a resident App Server is stale for this project, run: statewright-managed-client --kill-app-server (cwd: ${cwd})`, { code: "CODEX_HISTORY_REPAIR_REQUIRED", inspection });
-    return await withWriterLock({ home, codexHome: storage.codexHome, writerLockRoot: storage.writerLockRoot, sessionId, environment }, async () => {
-      const lockedInspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
-      const lockedClassification = classifyInspection(lockedInspection);
-      if (lockedClassification) return lockedClassification;
-      return repairCodexHistory({ sessionId, inspection: lockedInspection, backupRoot: effectiveBackupRoot, projectionPath: storage.projectionPath, operations: repairOperations });
-    });
+    let historyResult = classifyInspection(inspection);
+    if (!historyResult) {
+      if (mode === "guard") throw new CodexHistoryIntegrityError(`Statewright detected duplicate restart metadata and is refusing to resume from a stale paginated projection. Re-run once with STATEWRIGHT_CODEX_HISTORY_REPAIR=auto after exiting every writer for this thread. If a resident App Server is stale for this project, run: statewright-managed-client --kill-app-server (cwd: ${cwd})`, { code: "CODEX_HISTORY_REPAIR_REQUIRED", inspection });
+      historyResult = await withWriterLock({ home, codexHome: storage.codexHome, writerLockRoot: storage.writerLockRoot, sessionId, environment }, async () => {
+        const lockedInspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
+        const lockedClassification = classifyInspection(lockedInspection);
+        if (lockedClassification) return lockedClassification;
+        return repairCodexHistory({ sessionId, inspection: lockedInspection, backupRoot: effectiveBackupRoot, projectionPath: storage.projectionPath, operations: repairOperations });
+      });
+    }
+    const pointer = await staleThreadPointer({ storage, sessionId });
+    if (!pointer) return historyResult;
+    if (mode === "guard") throw new CodexHistoryIntegrityError("Statewright found a stale Codex rollout pointer left by a managed App Server. Re-run interactively with history repair set to prompt or auto; Statewright will back up the Codex state database before changing one exact thread row.", { code: "CODEX_HISTORY_STALE_POINTER" });
+    if (mode === "prompt") {
+      if (!process.stdin.isTTY || !process.stderr.isTTY) throw new CodexHistoryIntegrityError("Statewright found a repairable stale Codex rollout pointer but cannot prompt on a non-interactive terminal.", { code: "CODEX_HISTORY_REPAIR_PROMPT_REQUIRED" });
+      process.stderr.write(`[statewright] Codex indexed this session under a deleted managed App Server home. Back up the state database and relink this thread to ${pointer.canonicalPath}? [y/N] `);
+      const answer = await new Promise((resolve) => process.stdin.once("data", (chunk) => resolve(String(chunk).trim().toLowerCase())));
+      if (answer !== "y" && answer !== "yes") throw new CodexHistoryIntegrityError("Statewright left the stale Codex rollout pointer unchanged.", { code: "CODEX_HISTORY_REPAIR_DECLINED" });
+    }
+    return await repairStaleThreadPointer({ pointer, sessionId, backupRoot: effectiveBackupRoot });
   } catch (error) {
     if (error instanceof CodexHistoryIntegrityError) throw error;
     throw new CodexHistoryIntegrityError("Statewright could not inspect or repair Codex history safely. No unverified resume was started.", { code: "CODEX_HISTORY_OPERATION_FAILED", cause: error });
