@@ -37,6 +37,11 @@ const WINDOWS_PROCESS_TREE_ENV = new Set([
   "windir",
 ]);
 
+function statewrightEphemeralCodexHome(value) {
+  return typeof value === "string"
+    && /(?:^|[\\/])statewright-swc_[a-f0-9]{32}-app-server-[^\\/]+$/.test(value);
+}
+
 export function managedClientChildEnvironment({ host, environment = process.env, overrides = {} }) {
   const childEnvironment = { ...environment };
   for (const name of PARENT_MANAGED_IDENTITY_ENV) delete childEnvironment[name];
@@ -47,12 +52,11 @@ export function managedClientChildEnvironment({ host, environment = process.env,
     // target thread in argv and do not need either inherited variable.
     delete childEnvironment.CODEX_SESSION_ID;
     delete childEnvironment.CODEX_THREAD_ID;
-    // A managed App Server supplies its own temporary CODEX_HOME. Never
-    // propagate that path into a newly launched client: after the server is
-    // stopped it may point at a deleted projection and make every resume fail
-    // with Codex's misleading `no rollout found` error. The supervisor passes
-    // the canonical home explicitly where it is needed.
-    delete childEnvironment.CODEX_HOME;
+    // A managed App Server may leave its temporary CODEX_HOME in the parent
+    // environment. Drop only that Statewright-owned path; preserve an
+    // explicitly configured tenant/user home so managed clients remain
+    // isolated rather than silently collapsing onto the OS user's default.
+    if (statewrightEphemeralCodexHome(childEnvironment.CODEX_HOME)) delete childEnvironment.CODEX_HOME;
   }
   return { ...childEnvironment, ...overrides };
 }

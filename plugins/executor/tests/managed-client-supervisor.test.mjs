@@ -240,7 +240,7 @@ test("nested Codex launches discard parent thread and managed-control identities
       STATEWRIGHT_GATEWAY_URL: "https://mcp.statewright.ai",
       CODEX_SESSION_ID: "parent-session",
       CODEX_THREAD_ID: "parent-thread",
-      CODEX_HOME: "/tmp/stale-statewright-app-server-home",
+      CODEX_HOME: "/tmp/statewright-swc_0123456789abcdef0123456789abcdef-app-server-old",
       STATEWRIGHT_CLIENT_ID: "swc_parent",
       STATEWRIGHT_MCP_SESSION_ID: "parent-mcp-session",
       STATEWRIGHT_ROUTE_CONTROL_DIR: "/tmp/parent-control",
@@ -270,6 +270,19 @@ test("nested Codex launches discard parent thread and managed-control identities
   assert.equal(child.STATEWRIGHT_API_KEY, "keep-auth-config");
   assert.equal(child.STATEWRIGHT_GATEWAY_URL, "https://mcp.statewright.ai");
   assert.equal(child.PATH, "/usr/bin");
+});
+
+test("managed Codex preserves an explicit tenant home while dropping stale Statewright homes", () => {
+  const explicit = managedClientChildEnvironment({
+    host: "codex",
+    environment: { CODEX_HOME: "/srv/statewright/tenants/acme/codex" },
+  });
+  assert.equal(explicit.CODEX_HOME, "/srv/statewright/tenants/acme/codex");
+  const stale = managedClientChildEnvironment({
+    host: "codex",
+    environment: { CODEX_HOME: "/tmp/statewright-swc_0123456789abcdef0123456789abcdef-app-server-old" },
+  });
+  assert.equal(stale.CODEX_HOME, undefined);
 });
 
 test("Codex one-shot classification follows the top-level command grammar", () => {
