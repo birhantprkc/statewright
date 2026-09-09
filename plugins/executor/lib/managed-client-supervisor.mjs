@@ -47,6 +47,12 @@ export function managedClientChildEnvironment({ host, environment = process.env,
     // target thread in argv and do not need either inherited variable.
     delete childEnvironment.CODEX_SESSION_ID;
     delete childEnvironment.CODEX_THREAD_ID;
+    // A managed App Server supplies its own temporary CODEX_HOME. Never
+    // propagate that path into a newly launched client: after the server is
+    // stopped it may point at a deleted projection and make every resume fail
+    // with Codex's misleading `no rollout found` error. The supervisor passes
+    // the canonical home explicitly where it is needed.
+    delete childEnvironment.CODEX_HOME;
   }
   return { ...childEnvironment, ...overrides };
 }

@@ -240,6 +240,7 @@ test("nested Codex launches discard parent thread and managed-control identities
       STATEWRIGHT_GATEWAY_URL: "https://mcp.statewright.ai",
       CODEX_SESSION_ID: "parent-session",
       CODEX_THREAD_ID: "parent-thread",
+      CODEX_HOME: "/tmp/stale-statewright-app-server-home",
       STATEWRIGHT_CLIENT_ID: "swc_parent",
       STATEWRIGHT_MCP_SESSION_ID: "parent-mcp-session",
       STATEWRIGHT_ROUTE_CONTROL_DIR: "/tmp/parent-control",
@@ -264,6 +265,7 @@ test("nested Codex launches discard parent thread and managed-control identities
   assert.equal(child.STATEWRIGHT_MANAGED_TELEMETRY_OWNER, undefined);
   assert.equal(child.STATEWRIGHT_MANAGED_CODEX_ROOT_SESSION_ID, undefined);
   assert.equal(child.STATEWRIGHT_CLIENT_ID, "swc_child");
+  assert.equal(child.CODEX_HOME, undefined);
   assert.equal(child.STATEWRIGHT_ROUTE_CONTROL_DIR, "/tmp/child-control");
   assert.equal(child.STATEWRIGHT_API_KEY, "keep-auth-config");
   assert.equal(child.STATEWRIGHT_GATEWAY_URL, "https://mcp.statewright.ai");
