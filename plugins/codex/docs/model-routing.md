@@ -31,8 +31,9 @@ session owner for workflows that need model routing.
 
 The managed `codex` shim also has an experimental App Server transport for normal native TUI
 sessions. It keeps one local App Server alive, connects the unmodified Codex TUI with `--remote`,
-and applies a Statewright route only after the current turn completes. The next turn gets the new
-model and reasoning effort without an interrupt, a `resume`, or a model websocket reconnect.
+and applies a Statewright route only after the current turn completes. Same-provider routes update
+the next turn in place. Cross-provider routes retire only that managed resident, reconnect the TUI,
+and resume the same thread under the selected provider.
 
 It is off by default. Enable it in `~/.statewright/config.json`:
 
@@ -53,10 +54,45 @@ For a one-session rollback, launch Codex with
 `STATEWRIGHT_CODEX_TRANSPORT=app-server` enables the experimental transport without changing the
 file.
 
-The App Server receives an isolated temporary `CODEX_HOME`: its `config.toml` is copied and is the
-only file hot-reloaded for route changes; authentication, plugins, and other runtime state are
-shared by local symlink. Statewright removes that temporary directory when the managed TUI exits.
-The normal `~/.codex/config.toml` is never changed.
+The App Server receives an isolated temporary `CODEX_HOME`: its `config.toml` is copied;
+authentication, plugins, profile-v2 files, and other runtime state are shared by local symlink.
+The normal `~/.codex/config.toml` is never changed. Statewright preserves the isolated projection
+after shutdown so a TUI that is still unwinding can resolve its canonical rollout.
+
+## Mixed-provider native picker
+
+Codex binds `modelProvider` when a thread is loaded, while `model/list` entries and
+`thread/settings/update` contain only a model id. Statewright bridges that protocol gap by
+discovering Codex profile-v2 files in `$CODEX_HOME`, adding their catalog entries to `/model` with
+provider-qualified ids, and treating a cross-provider selection as an idle thread handoff.
+
+Keep the provider definition in the base Codex config:
+
+```toml
+[model_providers.local_compatible]
+name = "Local compatible provider"
+base_url = "https://models.example.invalid/v1"
+wire_api = "responses"
+requires_openai_auth = false
+```
+
+Then add `$CODEX_HOME/local.config.toml`:
+
+```toml
+model = "local-code-model"
+model_provider = "local_compatible"
+model_catalog_json = "/absolute/path/to/local-models.json"
+model_reasoning_effort = "low"
+web_search = "disabled"
+```
+
+The profile file must declare both `model_provider` and `model_catalog_json`. Provider URLs and
+credentials remain in Codex configuration; Statewright reads only the profile name, routing keys,
+and model catalog. The native picker displays both `openai/<model>` and
+`local_compatible/<model>` entries. For a thread with completed work, selecting either provider
+resumes the same thread id there. A provider change before the first turn has been accepted starts
+a fresh thread because Codex has no durable rollout to resume. If a turn is active, the provider
+change is refused with guidance to wait for completion.
 
 ## Run
 
@@ -138,13 +174,12 @@ To use the same workflow with a local provider and a cloud equivalent, declare a
 }
 ```
 
-The restart transport checks each `health_url` in order and launches the first available route,
-including its Codex `model_provider`. The persistent App Server transport instead chooses the
-ladder entry matching the provider that owns the current thread. Codex makes `modelProvider` a
-thread-level setting, so cross-provider outage failover requires the restart transport; a
-persistent thread can still use the same workflow without accidentally sending a local model id
-to OpenAI (or the inverse). The standalone adapter chooses the first ladder entry present in its
-active provider's live model catalog.
+Both managed transports check each `health_url` in order. The persistent App Server transport
+applies a candidate from the current provider in place. When the first healthy candidate belongs
+to another configured profile-v2 provider, it waits for the active turn to complete, records an
+atomic handoff, retires the exact resident, and resumes the same thread on that provider. The
+standalone adapter chooses the first ladder entry present in its active provider's live model
+catalog.
 
 Routing is fail-closed:
 
@@ -180,15 +215,22 @@ The writer strips prompt, input, arguments, content, and text fields and creates
 
 ## Protocol compatibility
 
-The implementation targets the protocol shipped by Codex CLI `0.144.1` and only uses methods
-present in that version's generated schema:
+The cross-provider transport is validated against Codex CLI `0.153.4`. It depends on these
+generated App Server protocol surfaces:
 
 - `initialize` / `initialized`
 - `model/list`
-- `thread/start` and `thread/resume`
+- `thread/start` and `thread/resume`, including the resume-time `model` and `modelProvider` fields
+- `thread/settings/update` and `thread/settings/updated`
+- `config/batchWrite`
 - `turn/start` and `turn/interrupt`
 - `mcpServerStatus/list` and `mcpServer/tool/call`
 - `item/completed`, `turn/completed`, `model/rerouted`, and token-usage notifications
+
+Additional providers must be configured as profile-v2 files at
+`$CODEX_HOME/<name>.config.toml`, with `model_provider` and `model_catalog_json` set. Use only one
+profile-v2 catalog for each provider id. Older Codex releases that do not expose the protocol
+fields above are outside this transport's validated compatibility boundary.
 
 Regenerate schemas after upgrading Codex and rerun the adapter tests before relying on routing:
 
