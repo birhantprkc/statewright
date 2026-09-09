@@ -114,7 +114,10 @@ open_keys_page() {
   [ "${STATEWRIGHT_NO_BROWSER:-false}" = "true" ] && return 1
   if [ "${OS:-}" = "Windows_NT" ] && command -v powershell.exe >/dev/null 2>&1; then
     if [ -n "${STATEWRIGHT_BROWSER_OPEN_PROBE:-}" ]; then
-      browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '${STATEWRIGHT_BROWSER_OPEN_PROBE}' -ArgumentList '$url' -Wait")
+      # Pass the URL as an explicit argument array.  A scalar ArgumentList is
+      # reparsed by PowerShell/Start-Process on Windows and can truncate query
+      # strings at `=` (causing a false onboarding result).
+      browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '${STATEWRIGHT_BROWSER_OPEN_PROBE}' -ArgumentList @('$url') -Wait")
     else
       browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '$url'")
     fi
