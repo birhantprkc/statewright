@@ -1,13 +1,13 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { access, chmod, copyFile, mkdir, open, opendir, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, open, opendir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const REPAIR_MODES = new Set(["guard", "repair", "auto", "off"]);
+const REPAIR_MODES = new Set(["guard", "repair", "auto", "prompt", "off"]);
 const CODEX_OPTIONS_WITH_VALUE = new Set([
   "-a", "--ask-for-approval", "-C", "--cd", "-c", "--config", "--local-provider",
   "-m", "--model", "-p", "--profile", "--remote", "--remote-auth-token-env",
@@ -546,7 +546,7 @@ async function repairCodexHistory({ sessionId, inspection, backupRoot, projectio
 }
 
 export function codexHistoryRepairMode({ environment = process.env, config = {} } = {}) {
-  const requested = String(environment.STATEWRIGHT_CODEX_HISTORY_REPAIR ?? config?.routing?.managed_clients?.codex_history_repair ?? "guard").toLowerCase();
+  const requested = String(environment.STATEWRIGHT_CODEX_HISTORY_REPAIR ?? config?.routing?.managed_clients?.codex_history_repair ?? "prompt").toLowerCase();
   return REPAIR_MODES.has(requested) ? requested : "guard";
 }
 
@@ -556,6 +556,29 @@ function classifyInspection(inspection) {
   if (inspection.historyMode !== "paginated") return { status: "not_applicable", historyMode: inspection.historyMode };
   if (inspection.status === "healthy") return { status: "healthy", finalOrdinal: inspection.finalOrdinal };
   return null;
+}
+
+async function repairPartialWrite({ path, sessionId, backupRoot }) {
+  const source = await readFile(path, "utf8");
+  const rows = [];
+  let buffer = "";
+  for (const line of source.split(/\r?\n/)) {
+    if (line === "" && buffer === "") continue;
+    buffer += line;
+    try { rows.push(JSON.parse(buffer)); buffer = ""; } catch {}
+  }
+  if (buffer.trim() || rows.length === 0 || rows[0]?.type !== "session_meta" || rows[0]?.payload?.id !== sessionId) return null;
+  for (let index = 0; index < rows.length; index += 1) if (rows[index]?.ordinal !== index) return null;
+  const normalized = `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
+  if (normalized === source) return null;
+  const backupDir = join(backupRoot, `codex-history-${sessionId}-${Date.now()}`);
+  await mkdir(backupDir, { recursive: true, mode: 0o700 });
+  const backupPath = join(backupDir, basename(path));
+  await copyFile(path, backupPath);
+  const temporary = `${path}.repair-${randomUUID()}.tmp`;
+  await writeFile(temporary, normalized, { mode: 0o600 });
+  await rename(temporary, path);
+  return { status: "repaired", repairKind: "partial_write", backupPath, finalOrdinal: rows.at(-1).ordinal };
 }
 
 export async function guardCodexResumeHistory({
@@ -569,6 +592,15 @@ export async function guardCodexResumeHistory({
     const storage = await resolveCodexHistoryStorage({ home, cwd, environment, args });
     const effectiveBackupRoot = backupRoot ?? join(storage.codexHome, "backups");
     const inspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
+    if (inspection.status === "unsafe" && mode === "prompt" && inspection.unknownAnomalies.some((item) => item.kind === "malformed_json")) {
+      if (!process.stdin.isTTY || !process.stderr.isTTY) throw new CodexHistoryIntegrityError("Statewright detected a recoverable-looking partial Codex write but cannot prompt on a non-interactive terminal. Re-run interactively to approve repair.", { code: "CODEX_HISTORY_REPAIR_PROMPT_REQUIRED", inspection });
+      process.stderr.write("[statewright] Codex history contains a recoverable-looking partial write. Back up and repair this session? [y/N] ");
+      const answer = await new Promise((resolve) => process.stdin.once("data", (chunk) => resolve(String(chunk).trim().toLowerCase())));
+      if (answer === "y" || answer === "yes") {
+        const repaired = await repairPartialWrite({ path: inspection.path, sessionId, backupRoot: effectiveBackupRoot });
+        if (repaired) return repaired;
+      }
+    }
     const classified = classifyInspection(inspection);
     if (classified) return classified;
     if (mode === "guard") throw new CodexHistoryIntegrityError("Statewright detected duplicate restart metadata and is refusing to resume from a stale paginated projection. Re-run once with STATEWRIGHT_CODEX_HISTORY_REPAIR=auto after exiting every writer for this thread.", { code: "CODEX_HISTORY_REPAIR_REQUIRED", inspection });
