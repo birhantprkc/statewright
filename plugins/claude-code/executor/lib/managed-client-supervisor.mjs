@@ -578,7 +578,7 @@ export async function runManagedClient({ host, command, args, environment = proc
   let bridge = null;
   let telemetry = null;
   try {
-    const identity = await resolveManagedClientIdentity({ host, args, home });
+    const identity = await resolveManagedClientIdentity({ host, args, home, cwd });
     const routedClientId = identity.clientId;
     if (host === "codex") codexRootSessionId = identity.sessionId;
     const config = host === "codex" ? await managedClientConfig(home) : {};
@@ -616,7 +616,7 @@ export async function runManagedClient({ host, command, args, environment = proc
       })) {
         const { ensureCodexAppServerResident, residentControlDir } = await import("./codex-app-server-resident.mjs");
         if (identity.sessionId) {
-          await bindManagedClientIdentity({ host, sessionId: identity.sessionId, clientId: routedClientId, home });
+          await bindManagedClientIdentity({ host, sessionId: identity.sessionId, clientId: routedClientId, home, cwd });
         }
         await preflightCodexHistory(args);
         const resident = await ensureCodexAppServerResident({

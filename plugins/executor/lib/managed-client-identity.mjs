@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 
 const STORE_FILE = "managed-client-session-ids.json";
 export const CODEX_ROOT_SESSION_FILE = "codex-root-session.json";
@@ -142,26 +142,31 @@ async function saveStore(home, store) {
   await chmod(path, 0o600);
 }
 
-function bindingKey(host, sessionId) {
-  return `${host}:${sessionId}`;
+function bindingKey(host, sessionId, cwd) {
+  return `${host}:${sessionId}:${resolvePath(cwd || process.cwd())}`;
 }
 
-export async function resolveManagedClientIdentity({ host, args, home = homedir() }) {
+export async function resolveManagedClientIdentity({ host, args, home = homedir(), cwd = process.cwd() }) {
   const sessionId = resumedSessionId(host, args);
   if (!sessionId) return { clientId: opaqueId(), sessionId: null, restored: false };
   const store = await loadStore(home);
-  const restored = store.bindings[bindingKey(host, sessionId)];
+  const key = bindingKey(host, sessionId, cwd);
+  const restored = store.bindings[key];
   if (validId(restored)) return { clientId: restored, sessionId, restored: true };
   const clientId = deterministicResumeId(host, sessionId);
-  store.bindings[bindingKey(host, sessionId)] = clientId;
+  // Scope resumed identities by project. A thread may be resumed from a
+  // different checkout; reusing the old client ID could attach it to the
+  // wrong resident app-server and cross project boundaries.
+  const scopedClientId = opaqueId();
+  store.bindings[key] = scopedClientId;
   await saveStore(home, store);
-  return { clientId, sessionId, restored: false };
+  return { clientId: scopedClientId, sessionId, restored: false };
 }
 
-export async function bindManagedClientIdentity({ host, sessionId, clientId, home = homedir() }) {
+export async function bindManagedClientIdentity({ host, sessionId, clientId, home = homedir(), cwd = process.cwd() }) {
   if (!sessionId || !validId(clientId)) return false;
   const store = await loadStore(home);
-  const key = bindingKey(host, sessionId);
+  const key = bindingKey(host, sessionId, cwd);
   if (store.bindings[key] === clientId) return true;
   if (store.bindings[key] && store.bindings[key] !== clientId) {
     throw new Error(`Statewright managed identity conflict for ${host} session '${sessionId}'.`);

@@ -145,6 +145,17 @@ test("managed identity persists a fresh session for a later Codex resume", async
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
+test("managed identity isolates a resumed thread across project directories", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-managed-identity-scope-"));
+  try {
+    const first = await resolveManagedClientIdentity({ host: "codex", args: ["resume", "shared-thread"], home, cwd: "/workspace/harbringer" });
+    const second = await resolveManagedClientIdentity({ host: "codex", args: ["resume", "shared-thread"], home, cwd: "/workspace/auldwyrm" });
+    assert.notEqual(first.clientId, second.clientId);
+    assert.equal(first.restored, false);
+    assert.equal(second.restored, false);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
 test("managed Codex resume runs the history guard before spawning the native client", async () => {
   const home = await mkdtemp(join(tmpdir(), "statewright-managed-history-guard-"));
   const fake = join(home, "fake-codex.mjs");
