@@ -195,7 +195,7 @@ async function cmdVersion(host, environment) {
 async function shellVersion(host, environment) {
   const result = await runPowerShell([
     "$ErrorActionPreference = 'Stop'",
-    `$command = Get-Command ${host} -CommandType Application -ErrorAction Stop`,
+    `$command = @(Get-Command ${host} -CommandType Application -ErrorAction Stop)[0]`,
     "& $command.Source --version",
     "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
     '[Console]::WriteLine("STATEWRIGHT_SOURCE=" + $command.Source)',
