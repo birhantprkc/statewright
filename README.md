@@ -4,7 +4,7 @@
 
 State machine guardrails that control which tools your AI agent can use in each phase. Define a workflow once, enforce it across Claude Code, Codex, Cursor, opencode, and Pi. [Full docs →](https://docs.statewright.ai)
 
-> **Statewright Plugin 0.3.1 release candidate for Claude and Codex:** managed routing now recovers invalid API keys, preserves active workflows across Stop hooks, and hardens Codex resume ownership and history handling. Assign a model, reasoning level, tool policy, and budget to each workflow phase while your agent continues through bounded work in the interface you already use. [Read the candidate release notes →](docs/releases/0.3.1.md)
+> **Statewright Codex Plugin 0.3.2:** managed resumes now recover narrowly recognized partial writes and stale rollout pointers through an explicit, backed-up repair path. Project-scoped App Servers and tenant homes remain isolated across restarts. [Read the release notes →](docs/releases/codex-0.3.2.md)
 
 ![Statewright workflow editor](docs/images/workflow-editor.png)
 
@@ -238,7 +238,7 @@ Point your agent at the [JSON schema](https://statewright.ai/workflow-schema.jso
 | Agent | Release line | Executor integration | Tool enforcement | Route boundary |
 |-------|--------------|----------------------|------------------|----------------|
 | [Claude Code](plugins/claude-code/) | 0.3.1 | Hooks + executor MCP bridge | Hard | Managed restart with forked session |
-| [Codex](plugins/codex/) | 0.3.1 | App-server hooks + shared executor bridge | Hard | Managed restart of the same thread |
+| [Codex](plugins/codex/) | 0.3.2 | App-server hooks + shared executor bridge | Hard | Managed restart of the same thread |
 | [Oh My Codex](plugins/omx/) | 0.1.x | Native hooks + executor MCP bridge | Hard | Startup |
 | [Pi](plugins/pi/) | 0.3.0 | Native extension + executor MCP bridge | Hard* | Live |
 | [OpenCode](plugins/opencode/) | 0.3.0 | Native plugin + executor MCP bridge | Hard | Live |

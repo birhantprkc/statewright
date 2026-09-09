@@ -184,7 +184,7 @@ test("managed Codex resume runs the history guard before spawning the native cli
     assert.deepEqual(calls[0].args, ["resume", "durable-thread"]);
     assert.equal(calls[0].environment.STATEWRIGHT_API_KEY, "test");
     assert.equal(calls[0].sessionId, "durable-thread");
-    assert.equal(calls[0].mode, "guard");
+    assert.equal(calls[0].mode, "prompt");
     await access(spawned);
   } finally { await rm(home, { recursive: true, force: true }); }
 });
@@ -678,7 +678,7 @@ test("managed supervisor preserves its own identity across a routed restart", as
     assert.equal(historyChecks[0].cwd, process.cwd());
     assert.equal(historyChecks[0].environment.STATEWRIGHT_API_KEY, "test");
     assert.equal(historyChecks[0].sessionId, "session-4");
-    assert.equal(historyChecks[0].mode, "guard");
+    assert.equal(historyChecks[0].mode, "prompt");
     assert.ok(historyChecks[0].args.includes("resume"));
     assert.ok(historyChecks[0].args.includes("session-4"));
   } finally { await rm(root, { recursive: true, force: true }); }

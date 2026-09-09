@@ -570,7 +570,7 @@ async function nextRouteRequest(controlDir, consumed) {
   return null;
 }
 
-export async function runManagedClient({ host, command, args, environment = process.env, cwd = process.cwd(), home = homedir(), pollMs = 100, bridgeFactory = (options) => new ManagedMcpBridge(options), historyGuard = guardCodexResumeHistory, reporter = createErrorReporter({ plugin: host === "claude" ? "claude-code" : "codex", version: "0.3.1", environment }) }) {
+export async function runManagedClient({ host, command, args, environment = process.env, cwd = process.cwd(), home = homedir(), pollMs = 100, bridgeFactory = (options) => new ManagedMcpBridge(options), historyGuard = guardCodexResumeHistory, reporter = createErrorReporter({ plugin: host === "claude" ? "claude-code" : "codex", version: host === "claude" ? "0.3.1" : "0.3.2", environment }) }) {
   if (!["codex", "claude"].includes(host)) throw new Error(`Unsupported managed client host '${host}'.`);
   const cmdShim = await resolveWindowsCmdShim(command);
   const launchCommand = cmdShim?.command ?? command;

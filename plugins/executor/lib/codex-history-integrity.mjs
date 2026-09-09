@@ -558,7 +558,24 @@ function classifyInspection(inspection) {
   return null;
 }
 
-async function repairPartialWrite({ path, sessionId, backupRoot }) {
+async function requestRepairConsent({ message, inspection }) {
+  if (!process.stdin.isTTY || !process.stderr.isTTY) {
+    throw new CodexHistoryIntegrityError("Statewright found repairable Codex history but cannot request approval on a non-interactive terminal. Re-run interactively to approve repair.", { code: "CODEX_HISTORY_REPAIR_PROMPT_REQUIRED", inspection });
+  }
+  process.stderr.write(message);
+  const answer = await new Promise((resolve) => process.stdin.once("data", (chunk) => resolve(String(chunk).trim().toLowerCase())));
+  return answer === "y" || answer === "yes";
+}
+
+async function requireRepairConsent({ mode, confirmRepair, message, inspection }) {
+  if (mode !== "prompt") return;
+  if (!await confirmRepair({ message, inspection })) {
+    throw new CodexHistoryIntegrityError("Statewright left Codex history unchanged because repair was not approved.", { code: "CODEX_HISTORY_REPAIR_DECLINED", inspection });
+  }
+}
+
+async function repairPartialWrite({ inspection, sessionId, backupRoot, operations = {} }) {
+  const path = inspection.path;
   const source = await readFile(path, "utf8");
   const rows = [];
   let buffer = "";
@@ -571,14 +588,54 @@ async function repairPartialWrite({ path, sessionId, backupRoot }) {
   for (let index = 0; index < rows.length; index += 1) if (rows[index]?.ordinal !== index) return null;
   const normalized = `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
   if (normalized === source) return null;
-  const backupDir = join(backupRoot, `codex-history-${sessionId}-${Date.now()}`);
-  await mkdir(backupDir, { recursive: true, mode: 0o700 });
-  const backupPath = join(backupDir, basename(path));
-  await copyFile(path, backupPath);
   const temporary = `${path}.repair-${randomUUID()}.tmp`;
-  await writeFile(temporary, normalized, { mode: 0o600 });
-  await rename(temporary, path);
-  return { status: "repaired", repairKind: "partial_write", backupPath, finalOrdinal: rows.at(-1).ordinal };
+  const sourceMode = (await stat(path)).mode & 0o777;
+  try {
+    await (operations.writePartialCandidate ?? writeFile)(temporary, normalized, { mode: sourceMode, flag: "wx" });
+    await syncFile(temporary);
+    const candidate = await inspectRolloutPath(temporary, sessionId, { requireCanonicalFilename: false });
+    if (candidate.status !== "healthy" || candidate.historyMode !== "paginated" || candidate.finalOrdinal !== rows.at(-1).ordinal) {
+      throw new CodexHistoryIntegrityError("The reconstructed Codex rollout did not satisfy the complete history contract, so Statewright did not replace the session.", { code: "CODEX_HISTORY_CANDIDATE_INVALID", inspection: candidate });
+    }
+
+    const backupRootExisted = await pathExists(backupRoot);
+    await mkdir(backupRoot, { recursive: true, mode: 0o700 });
+    if (!backupRootExisted) await syncDirectory(dirname(backupRoot));
+    const backupDir = join(backupRoot, `codex-history-${sessionId}-${Date.now()}`);
+    await mkdir(backupDir, { recursive: false, mode: 0o700 });
+    await syncDirectory(backupRoot);
+    const backupPath = join(backupDir, basename(path));
+    const manifestPath = join(backupDir, "manifest.json");
+    await copyFile(path, backupPath);
+    await chmod(backupPath, 0o600);
+    await syncFile(backupPath);
+    if (await sha256(backupPath) !== inspection.sourceSha256) {
+      throw new CodexHistoryIntegrityError("Codex history changed while Statewright prepared its backup. Nothing was replaced; retry after the writer is idle.", { code: "CODEX_HISTORY_SOURCE_CHANGED", inspection });
+    }
+    await writeJsonAtomic(manifestPath, {
+      version: 1, state: "prepared", created_at: new Date().toISOString(), thread_id: sessionId,
+      rollout_path: path, rollout_backup: backupPath, rollout_original_sha256: inspection.sourceSha256,
+      repaired_sha256: candidate.sourceSha256,
+      rollback: "Stop every Codex writer, then restore rollout_backup to rollout_path.",
+    });
+    await operations.beforePartialCompareAndSwap?.({ path });
+    const currentIdentity = sourceIdentity(await stat(path));
+    const currentHash = await sha256(path);
+    if (!sameSourceIdentity(currentIdentity, inspection.sourceIdentity) || currentHash !== inspection.sourceSha256) {
+      throw new CodexHistoryIntegrityError("Codex history changed while Statewright prepared the partial-write repair. Nothing was replaced; retry after the writer is idle.", { code: "CODEX_HISTORY_SOURCE_CHANGED", inspection });
+    }
+    await rename(temporary, path);
+    await syncDirectory(dirname(path));
+    await writeJsonAtomic(manifestPath, {
+      version: 1, state: "completed", created_at: new Date().toISOString(), completed_at: new Date().toISOString(), thread_id: sessionId,
+      rollout_path: path, rollout_backup: backupPath, rollout_original_sha256: inspection.sourceSha256,
+      repaired_sha256: candidate.sourceSha256,
+      rollback: "Stop every Codex writer, then restore rollout_backup to rollout_path.",
+    });
+    return { status: "repaired", repairKind: "partial_write", backupPath, finalOrdinal: candidate.finalOrdinal };
+  } finally {
+    await unlink(temporary).catch(() => {});
+  }
 }
 
 function statewrightAppServerRolloutPath(path) {
@@ -657,7 +714,7 @@ async function repairStaleThreadPointer({ pointer, sessionId, backupRoot }) {
 
 export async function guardCodexResumeHistory({
   home = homedir(), cwd = process.cwd(), args = [], sessionId, mode = "guard", backupRoot = null,
-  environment = process.env, withWriterLock = withCodexWriterLock, repairOperations = {},
+  environment = process.env, withWriterLock = withCodexWriterLock, repairOperations = {}, confirmRepair = requestRepairConsent,
 } = {}) {
   try {
     if (!sessionId || mode === "off") return { status: "skipped" };
@@ -666,18 +723,34 @@ export async function guardCodexResumeHistory({
     const storage = await resolveCodexHistoryStorage({ home, cwd, environment, args });
     const effectiveBackupRoot = backupRoot ?? join(storage.codexHome, "backups");
     let inspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
-    if (inspection.status === "unsafe" && mode === "prompt" && inspection.unknownAnomalies.some((item) => item.kind === "malformed_json")) {
-      if (!process.stdin.isTTY || !process.stderr.isTTY) throw new CodexHistoryIntegrityError("Statewright detected a recoverable-looking partial Codex write but cannot prompt on a non-interactive terminal. Re-run interactively to approve repair.", { code: "CODEX_HISTORY_REPAIR_PROMPT_REQUIRED", inspection });
-      process.stderr.write("[statewright] Codex history contains a recoverable-looking partial write. Back up and repair this session? [y/N] ");
-      const answer = await new Promise((resolve) => process.stdin.once("data", (chunk) => resolve(String(chunk).trim().toLowerCase())));
-      if (answer === "y" || answer === "yes") {
-        const repaired = await repairPartialWrite({ path: inspection.path, sessionId, backupRoot: effectiveBackupRoot });
-        if (repaired) inspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
-      }
+    let partialRepairResult = null;
+    const partialWriteCandidate = inspection.status === "unsafe"
+      && recognizedFilename(inspection.path, sessionId)
+      && inspection.unknownAnomalies.some((item) => item.kind === "malformed_json");
+    if (partialWriteCandidate) {
+      if (mode === "guard") classifyInspection(inspection);
+      await requireRepairConsent({
+        mode, confirmRepair,
+        message: "[statewright] Codex history contains a recoverable-looking partial write. Back up and repair this session? [y/N] ",
+        inspection,
+      });
+      partialRepairResult = await withWriterLock({ home, codexHome: storage.codexHome, writerLockRoot: storage.writerLockRoot, sessionId, environment }, async () => {
+        const lockedInspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
+        if (!lockedInspection.path || !recognizedFilename(lockedInspection.path, sessionId)) return classifyInspection(lockedInspection);
+        if (lockedInspection.status !== "unsafe" || !lockedInspection.unknownAnomalies.some((item) => item.kind === "malformed_json")) return classifyInspection(lockedInspection);
+        return repairPartialWrite({ inspection: lockedInspection, sessionId, backupRoot: effectiveBackupRoot, operations: repairOperations });
+      });
+      inspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
     }
     let historyResult = classifyInspection(inspection);
+    if (partialRepairResult?.repairKind === "partial_write") historyResult = partialRepairResult;
     if (!historyResult) {
       if (mode === "guard") throw new CodexHistoryIntegrityError(`Statewright detected duplicate restart metadata and is refusing to resume from a stale paginated projection. Re-run once with STATEWRIGHT_CODEX_HISTORY_REPAIR=auto after exiting every writer for this thread. If a resident App Server is stale for this project, run: statewright-managed-client --kill-app-server (cwd: ${cwd})`, { code: "CODEX_HISTORY_REPAIR_REQUIRED", inspection });
+      await requireRepairConsent({
+        mode, confirmRepair,
+        message: "[statewright] Codex history contains duplicate restart metadata. Back up and repair this session? [y/N] ",
+        inspection,
+      });
       historyResult = await withWriterLock({ home, codexHome: storage.codexHome, writerLockRoot: storage.writerLockRoot, sessionId, environment }, async () => {
         const lockedInspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
         const lockedClassification = classifyInspection(lockedInspection);
@@ -689,10 +762,11 @@ export async function guardCodexResumeHistory({
     if (!pointer) return historyResult;
     if (mode === "guard") throw new CodexHistoryIntegrityError("Statewright found a stale Codex rollout pointer left by a managed App Server. Re-run interactively with history repair set to prompt or auto; Statewright will back up the Codex state database before changing one exact thread row.", { code: "CODEX_HISTORY_STALE_POINTER" });
     if (mode === "prompt") {
-      if (!process.stdin.isTTY || !process.stderr.isTTY) throw new CodexHistoryIntegrityError("Statewright found a repairable stale Codex rollout pointer but cannot prompt on a non-interactive terminal.", { code: "CODEX_HISTORY_REPAIR_PROMPT_REQUIRED" });
-      process.stderr.write(`[statewright] Codex indexed this session under a deleted managed App Server home. Back up the state database and relink this thread to ${pointer.canonicalPath}? [y/N] `);
-      const answer = await new Promise((resolve) => process.stdin.once("data", (chunk) => resolve(String(chunk).trim().toLowerCase())));
-      if (answer !== "y" && answer !== "yes") throw new CodexHistoryIntegrityError("Statewright left the stale Codex rollout pointer unchanged.", { code: "CODEX_HISTORY_REPAIR_DECLINED" });
+      await requireRepairConsent({
+        mode, confirmRepair,
+        message: `[statewright] Codex indexed this session under a deleted managed App Server home. Back up the state database and relink this thread to ${pointer.canonicalPath}? [y/N] `,
+        inspection,
+      });
     }
     return await repairStaleThreadPointer({ pointer, sessionId, backupRoot: effectiveBackupRoot });
   } catch (error) {

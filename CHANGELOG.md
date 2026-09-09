@@ -3,6 +3,20 @@
 All notable changes to statewright are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Codex Plugin 0.3.2] — 2026-09-09
+
+### Added
+- **[plugin/codex]** Explicit, backup-first repair for narrowly recognized partial Codex rollout writes and stale App Server rollout pointers
+- **[plugin/codex]** Project-scoped managed App Server shutdown command with interactive selection when more than one resident matches
+- **[plugin/codex]** Provider-aware model ladders at managed route boundaries
+
+### Fixed
+- **[plugin/codex]** Preserve caller-selected tenant homes while rejecting only Statewright-owned ephemeral child homes
+- **[plugin/codex]** Preserve the canonical session projection across managed App Server shutdown and resume
+- **[plugin/codex]** Scope resident identities and resume routing by canonical project working directory
+- **[plugin/codex]** Prevent nested or stale child process identities from taking ownership of the parent route
+- **[plugin/codex]** Keep native token telemetry attached across managed route restarts
+
 ## [Unreleased]
 
 ### Changed
@@ -146,6 +160,7 @@ Initial commit. Engine, agent, and Claude Code plugin scaffolding.
 - **[docs]** Project README
 
 [Unreleased]: https://github.com/statewright/statewright/compare/v1.1.0...HEAD
+[Codex Plugin 0.3.2]: https://github.com/statewright/statewright/compare/codex-v0.3.1...codex-v0.3.2
 [1.1.0]: https://github.com/statewright/statewright/compare/v1...v1.1.0
 [1.0.0]: https://github.com/statewright/statewright/releases/tag/v1
 [0.1.0]: https://github.com/statewright/statewright/commit/464d0c3

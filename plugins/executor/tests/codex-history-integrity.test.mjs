@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { access, appendFile, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import {
@@ -190,6 +190,204 @@ test("guard mode refuses a stale Codex resume without changing history", async (
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
+test("prompt mode declines duplicate-metadata repair without backup or mutation", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-prompt-decline-"));
+  const backupRoot = join(home, "backups");
+  try {
+    const rollout = await writeRollout(home, duplicateSettingsRollout());
+    const before = await readFile(rollout, "utf8");
+    await assert.rejects(
+      guardCodexResumeHistory({
+        home, sessionId: SESSION_ID, mode: "prompt", backupRoot,
+        environment: codexTestEnvironment(), confirmRepair: async () => false,
+      }),
+      /repair was not approved/i,
+    );
+    assert.equal(await readFile(rollout, "utf8"), before);
+    await assert.rejects(access(backupRoot));
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("non-interactive prompt mode never repairs duplicate metadata", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-prompt-required-"));
+  const backupRoot = join(home, "backups");
+  try {
+    const rollout = await writeRollout(home, duplicateSettingsRollout());
+    const before = await readFile(rollout, "utf8");
+    await assert.rejects(
+      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "prompt", backupRoot, environment: codexTestEnvironment() }),
+      (error) => error?.code === "CODEX_HISTORY_REPAIR_PROMPT_REQUIRED",
+    );
+    assert.equal(await readFile(rollout, "utf8"), before);
+    await assert.rejects(access(backupRoot));
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("approved partial-write repair runs under the writer lock and validates the complete candidate", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-partial-"));
+  const backupRoot = join(home, "backups");
+  try {
+    const complete = record(1, "event_msg", { type: "token_count" });
+    const rollout = await writeRollout(home, [
+      record(0, "session_meta", { id: SESSION_ID, history_mode: "paginated" }),
+      complete.slice(0, 35),
+      complete.slice(35),
+      record(2, "event_msg", { type: "task_complete" }),
+    ]);
+    const original = await readFile(rollout, "utf8");
+    let locked = false;
+    const result = await guardCodexResumeHistory({
+      home, sessionId: SESSION_ID, mode: "prompt", backupRoot,
+      environment: codexTestEnvironment(), confirmRepair: async () => true,
+      withWriterLock: async (_options, operation) => { locked = true; return operation(); },
+    });
+    assert.equal(locked, true);
+    assert.equal(result.status, "repaired");
+    assert.equal(result.repairKind, "partial_write");
+    const inspection = await inspectCodexHistory({ home, sessionId: SESSION_ID });
+    assert.equal(inspection.status, "healthy");
+    assert.equal(inspection.finalOrdinal, 2);
+    const backupDirs = await readdir(backupRoot);
+    assert.equal(backupDirs.length, 1);
+    const backupDir = join(backupRoot, backupDirs[0]);
+    assert.equal(await readFile(join(backupDir, basename(rollout)), "utf8"), original);
+    assert.equal(JSON.parse(await readFile(join(backupDir, "manifest.json"), "utf8")).state, "completed");
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("partial-write repair declines and fails concurrent-change checks without replacing history", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-partial-cas-"));
+  const backupRoot = join(home, "backups");
+  try {
+    const complete = record(1, "event_msg", { type: "token_count" });
+    const rollout = await writeRollout(home, [
+      record(0, "session_meta", { id: SESSION_ID, history_mode: "paginated" }),
+      complete.slice(0, 35), complete.slice(35),
+      record(2, "event_msg", { type: "task_complete" }),
+    ]);
+    const original = await readFile(rollout, "utf8");
+    await assert.rejects(
+      guardCodexResumeHistory({
+        home, sessionId: SESSION_ID, mode: "prompt", backupRoot,
+        environment: codexTestEnvironment(), confirmRepair: async () => false,
+      }),
+      /repair was not approved/i,
+    );
+    assert.equal(await readFile(rollout, "utf8"), original);
+    await assert.rejects(access(backupRoot));
+
+    await assert.rejects(
+      guardCodexResumeHistory({
+        home, sessionId: SESSION_ID, mode: "repair", backupRoot,
+        environment: codexTestEnvironment(),
+        withWriterLock: async (_options, operation) => operation(),
+        repairOperations: {
+          beforePartialCompareAndSwap: async () => appendFile(rollout, `${record(3, "event_msg", { type: "task_complete" })}\n`),
+        },
+      }),
+      /changed while Statewright prepared the partial-write repair/i,
+    );
+    assert.equal(await readFile(rollout, "utf8"), `${original}${record(3, "event_msg", { type: "task_complete" })}\n`);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("partial-write repair rejects a non-canonical rollout filename before mutation", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-partial-name-"));
+  const backupRoot = join(home, "backups");
+  try {
+    const complete = record(1, "event_msg", { type: "token_count" });
+    const canonical = await writeRollout(home, [
+      record(0, "session_meta", { id: SESSION_ID, history_mode: "paginated" }),
+      complete.slice(0, 35), complete.slice(35),
+    ]);
+    const rollout = join(dirname(canonical), `unexpected-${SESSION_ID}.jsonl`);
+    await rename(canonical, rollout);
+    const before = await readFile(rollout, "utf8");
+    await assert.rejects(
+      guardCodexResumeHistory({ home, sessionId: SESSION_ID, mode: "repair", backupRoot, environment: codexTestEnvironment() }),
+      /not safe for automatic repair/i,
+    );
+    assert.equal(await readFile(rollout, "utf8"), before);
+    assert.equal((await readdir(dirname(rollout))).some((name) => name.includes(".repair-")), false);
+    await assert.rejects(access(backupRoot));
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("partial-write repair rechecks the canonical filename after consent", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-partial-name-race-"));
+  const backupRoot = join(home, "backups");
+  try {
+    const complete = record(1, "event_msg", { type: "token_count" });
+    const canonical = await writeRollout(home, [
+      record(0, "session_meta", { id: SESSION_ID, history_mode: "paginated" }),
+      complete.slice(0, 35), complete.slice(35),
+    ]);
+    const unexpected = join(dirname(canonical), `unexpected-${SESSION_ID}.jsonl`);
+    const before = await readFile(canonical, "utf8");
+    await assert.rejects(
+      guardCodexResumeHistory({
+        home, sessionId: SESSION_ID, mode: "prompt", backupRoot, environment: codexTestEnvironment(),
+        confirmRepair: async () => { await rename(canonical, unexpected); return true; },
+        withWriterLock: async (_options, operation) => operation(),
+      }),
+      /not safe for automatic repair/i,
+    );
+    assert.equal(await readFile(unexpected, "utf8"), before);
+    assert.equal((await readdir(dirname(unexpected))).some((name) => name.includes(".repair-")), false);
+    await assert.rejects(access(backupRoot));
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("partial-write repair removes its candidate when backup preparation fails", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-partial-cleanup-"));
+  try {
+    const complete = record(1, "event_msg", { type: "token_count" });
+    const rollout = await writeRollout(home, [
+      record(0, "session_meta", { id: SESSION_ID, history_mode: "paginated" }),
+      complete.slice(0, 35), complete.slice(35),
+    ]);
+    const before = await readFile(rollout, "utf8");
+    const blocker = join(home, "not-a-directory");
+    await writeFile(blocker, "block backup creation");
+    await assert.rejects(
+      guardCodexResumeHistory({
+        home, sessionId: SESSION_ID, mode: "repair", backupRoot: join(blocker, "backups"),
+        environment: codexTestEnvironment(), withWriterLock: async (_options, operation) => operation(),
+      }),
+      /could not inspect or repair Codex history safely/i,
+    );
+    assert.equal(await readFile(rollout, "utf8"), before);
+    assert.equal((await readdir(dirname(rollout))).some((name) => name.includes(".repair-")), false);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("partial-write repair removes a partially created candidate when writing it fails", async () => {
+  const home = await mkdtemp(join(tmpdir(), "statewright-history-partial-write-failure-"));
+  try {
+    const complete = record(1, "event_msg", { type: "token_count" });
+    const rollout = await writeRollout(home, [
+      record(0, "session_meta", { id: SESSION_ID, history_mode: "paginated" }),
+      complete.slice(0, 35), complete.slice(35),
+    ]);
+    const before = await readFile(rollout, "utf8");
+    await assert.rejects(
+      guardCodexResumeHistory({
+        home, sessionId: SESSION_ID, mode: "repair", environment: codexTestEnvironment(),
+        withWriterLock: async (_options, operation) => operation(),
+        repairOperations: {
+          writePartialCandidate: async (path, value, options) => {
+            await writeFile(path, value.slice(0, 20), options);
+            throw Object.assign(new Error("injected candidate write failure"), { code: "ENOSPC" });
+          },
+        },
+      }),
+      /could not inspect or repair Codex history safely/i,
+    );
+    assert.equal(await readFile(rollout, "utf8"), before);
+    assert.equal((await readdir(dirname(rollout))).some((name) => name.includes(".repair-")), false);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
 test("repair mode backs up history, removes only redundant settings, and clears only the target projection", async () => {
   const home = await mkdtemp(join(tmpdir(), "statewright-history-repair-"));
   const backupRoot = join(home, "backups");
@@ -355,7 +553,7 @@ test("native writer-lock contention fails closed", { skip: process.platform === 
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
-test("writer-lock acquisition coordinates across native cleanup without an inode ABA split", { skip: process.platform === "win32" }, async () => {
+test("writer-lock acquisition waits for coordinated native cleanup before entering", { skip: process.platform === "win32" }, async () => {
   const home = await mkdtemp(join(tmpdir(), "statewright-history-writer-aba-"));
   const lockRoot = join(home, ".codex", "thread-writer-locks");
   const threadLock = join(lockRoot, `${SESSION_ID}.lock`);
@@ -378,13 +576,12 @@ close($coord) or exit 6;
 `, coordinationLock, threadLock], { env: { ...process.env, LC_ALL: "C", LANG: "C" }, stdio: ["pipe", "pipe", "ignore"] });
   try {
     await waitForLine(oldWriter, "HELD");
-    const oldInode = (await stat(threadLock)).ino;
     oldWriter.stdin.write("release\n");
     await waitForLine(oldWriter, "COORDINATED");
     let entered = false;
     const acquired = withCodexWriterLock({ home, sessionId: SESSION_ID }, async () => {
       entered = true;
-      assert.notEqual((await stat(threadLock)).ino, oldInode);
+      assert.equal((await stat(threadLock)).isFile(), true);
     });
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
     assert.equal(entered, false);

@@ -71,6 +71,7 @@ test("capability versions match package and runtime identities", async () => {
   }
 
   const runtimeSources = {
+    codex: await readFile(resolve(root, "plugins/codex/scripts/statewright-codex.mjs"), "utf8"),
     omx: await readFile(resolve(root, "plugins/omx/src/hook.ts"), "utf8"),
     opencode: await readFile(resolve(root, "plugins/opencode/src/index.ts"), "utf8"),
     pi: await readFile(resolve(root, "plugins/pi/src/index.ts"), "utf8"),

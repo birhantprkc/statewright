@@ -100,12 +100,13 @@ test("plugin release workflow resolves distinct names and curated notes", async 
   const codexVersion = codexManifest.version.split("+")[0];
   const claudeVersion = claudeManifest.version;
 
-  assert.equal(codexVersion, claudeVersion, "Codex and Claude must share the release-note version");
-  await readFile(resolve(root, `docs/releases/${codexVersion}.md`), "utf8");
+  await readFile(resolve(root, `docs/releases/codex-${codexVersion}.md`), "utf8");
+  await readFile(resolve(root, `docs/releases/claude-${claudeVersion}.md`), "utf8");
 
   assert.match(workflow, /release_name=Statewright Codex plugin \$version/);
   assert.match(workflow, /release_name=Statewright Claude Code plugin \$version/);
-  assert.match(workflow, /notes_path=docs\/releases\/\$version\.md/);
+  assert.match(workflow, /notes_path=docs\/releases\/codex-\$version\.md/);
+  assert.match(workflow, /notes_path=docs\/releases\/claude-\$version\.md/);
   assert.match(workflow, /body_path: "\${{ needs\.package\.outputs\.notes_path }}"/);
   assert.doesNotMatch(workflow, /generate_release_notes:/);
   assert.match(workflow, /actions: read/);
