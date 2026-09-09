@@ -261,9 +261,9 @@ case "$ENDPOINT" in
       # Open browser once
       if [ ! -f "$STATEWRIGHT_DIR/.prompted" ]; then
         if command -v open &> /dev/null; then
-          open "https://statewright.ai/signup?redirect=/keys" 2>/dev/null
+          open "https://statewright.ai/signup?redirect=%2Fkeys" 2>/dev/null
         elif command -v xdg-open &> /dev/null; then
-          xdg-open "https://statewright.ai/signup?redirect=/keys" 2>/dev/null
+          xdg-open "https://statewright.ai/signup?redirect=%2Fkeys" 2>/dev/null
         fi
         mkdir -p "$STATEWRIGHT_DIR"
         touch "$STATEWRIGHT_DIR/.prompted"

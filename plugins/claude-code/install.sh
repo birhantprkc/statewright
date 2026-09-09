@@ -31,12 +31,12 @@ if [ ! -f "$PLUGIN_DIR/api_key" ]; then
   echo ""
 
   if command -v open &> /dev/null; then
-    open "${STATEWRIGHT_URL}/signup?redirect=/keys"
+    open "${STATEWRIGHT_URL}/signup?redirect=%2Fkeys"
   elif command -v xdg-open &> /dev/null; then
-    xdg-open "${STATEWRIGHT_URL}/signup?redirect=/keys"
+    xdg-open "${STATEWRIGHT_URL}/signup?redirect=%2Fkeys"
   else
     echo "  Open this URL in your browser:"
-    echo "  ${STATEWRIGHT_URL}/signup?redirect=/keys"
+    echo "  ${STATEWRIGHT_URL}/signup?redirect=%2Fkeys"
   fi
 
   echo "  1. Sign up or log in"

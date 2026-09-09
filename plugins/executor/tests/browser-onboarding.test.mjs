@@ -74,7 +74,7 @@ for (const [name, proxy] of proxies) {
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "Start-Process -FilePath 'https://statewright.ai/signup?redirect=/keys'",
+        "Start-Process -FilePath 'https://statewright.ai/signup?redirect=%2Fkeys'",
       ]);
       assert.equal(await readFile(join(home, ".statewright", "missing_api_key_prompted"), "utf8"), "");
     } finally {

@@ -137,7 +137,7 @@ open_keys_page() {
 prompt_missing_key() {
   mkdir -p "$STATEWRIGHT_DIR" 2>/dev/null || return 0
   if [ ! -f "$MISSING_KEY_SENTINEL" ]; then
-    if open_keys_page 'https://statewright.ai/signup?redirect=/keys'; then
+    if open_keys_page 'https://statewright.ai/signup?redirect=%2Fkeys'; then
       : > "$MISSING_KEY_SENTINEL"
       chmod 600 "$MISSING_KEY_SENTINEL"
     fi

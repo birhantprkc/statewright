@@ -79,7 +79,7 @@ for (const [name, proxyUrl] of plugins) {
 
     assert.deepEqual(
       (await readFile(resultPath, "utf8")).trim().split(/\r?\n/),
-      ["https://statewright.ai/signup?redirect=/keys"],
+      ["https://statewright.ai/signup?redirect=%2Fkeys"],
       `${name} must launch exactly once with the signup URL through real PowerShell Start-Process`,
     );
     assert.equal(
