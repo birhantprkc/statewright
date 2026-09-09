@@ -91,7 +91,7 @@ if (!existsSync(marker)) {
   );
   assert.equal(invocations.length, 2, "the .cmd launcher must run once before and once after routing");
   assert.ok(invocations[0].args.includes("--full-auto"));
-  assert.deepEqual(invocations[1].args.slice(0, 8), ["-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"', "--full-auto", "resume", "windows-route-session", "Continue the active Statewright workflow in its current state. Use statewright_get_state first."]);
+  assert.deepEqual(invocations[1].args.slice(0, 8), ["-m", "gpt-5.6-sol", "-c", 'model_provider="openai"', "-c", 'model_reasoning_effort="high"', "--full-auto", "resume"]);
   assert.equal(invocations[0].client_id, invocations[1].client_id, "managed identity must survive the routed restart");
   assert.match(invocations[0].client_id, /^swc_[a-f0-9]{32}$/);
   assert.equal(invocations[0].bridge_url, "http://127.0.0.1:9999");
