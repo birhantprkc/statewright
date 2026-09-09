@@ -864,8 +864,8 @@ export async function installManagedClientShim({ host, launcherPath, home = home
   await mkdir(shimDirectory, { recursive: true });
   const shimPath = join(shimDirectory, windowsPlatform(platform) ? `${host}.cmd` : host);
   const contents = windowsPlatform(platform)
-    ? `@echo off\r\n\"${process.execPath}\" \"${launcherPath}\" --host \"${host}\" --real-bin \"${binary}\" -- %*\r\n`
-    : `#!/usr/bin/env sh\nexec node ${JSON.stringify(launcherPath)} --host ${JSON.stringify(host)} --real-bin ${JSON.stringify(binary)} -- \"$@\"\n`;
+    ? `@echo off\r\nif /I \"%~1\"==\"--kill-app-server\" (\r\n  \"${process.execPath}\" \"${launcherPath}\" %*\r\n  exit /b %ERRORLEVEL%\r\n)\r\n\"${process.execPath}\" \"${launcherPath}\" --host \"${host}\" --real-bin \"${binary}\" -- %*\r\n`
+    : `#!/usr/bin/env sh\nif [ \"${host}\" = \"codex\" ] && [ \"\${1:-}\" = \"--kill-app-server\" ]; then\n  exec node ${JSON.stringify(launcherPath)} \"$@\"\nfi\nexec node ${JSON.stringify(launcherPath)} --host ${JSON.stringify(host)} --real-bin ${JSON.stringify(binary)} -- \"$@\"\n`;
   await writeFile(shimPath, contents, { mode: windowsPlatform(platform) ? undefined : 0o755 });
   if (!windowsPlatform(platform)) await chmod(shimPath, 0o755);
   return { shimDirectory, shimPath, realBinary: binary };
