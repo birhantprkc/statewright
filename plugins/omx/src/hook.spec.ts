@@ -402,6 +402,8 @@ describe("handleUserPrompt", () => {
     expect(result).not.toBeNull()
     expect(result!.decision).toBe("block")
     expect(result!.reason).toContain("API key")
+    expect(result!.reason).toContain("https://statewright.ai/keys")
+    expect(result!.reason).toContain("paste it here")
   })
 
   it("saves pasted API key from input", async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { callStatewrightGateway, initializeStatewrightGateway } from "./hook"
+import { callStatewrightGateway, initializeStatewrightGateway } from "../dist/hook.js"
 
 const live = process.env.STATEWRIGHT_PLUGIN_PRODUCTION_CANARY === "1"
 

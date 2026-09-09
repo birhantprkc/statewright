@@ -162,6 +162,12 @@ jobs:
         run: |
           test -n "$STATEWRIGHT_API_KEY" || { echo "STATEWRIGHT_PLUGIN_CANARY_API_KEY is required." >&2; exit 1; }
           node plugins/executor/tests/unix-plugin-live-gateway-canary.mjs "${{ needs.package.outputs.plugin }}"
+      - name: Submit packaged plugin adoption telemetry event
+        env:
+          STATEWRIGHT_API_KEY: ${{ secrets.STATEWRIGHT_PLUGIN_CANARY_API_KEY }}
+          STATEWRIGHT_PB_URL: https://statewright.ai
+          STATEWRIGHT_PLUGIN_PRODUCTION_CANARY: "1"
+        run: node plugins/executor/tests/plugin-adoption-telemetry-canary.mjs "${{ needs.package.outputs.plugin }}" "${{ needs.package.outputs.version }}"
       - name: Record packaged-artifact evidence
         if: always()
         env:

@@ -12,15 +12,19 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/windows-plugin-canary.yml"
+      - "plugins/capabilities.json"
       - "plugins/executor/**"
       - "plugins/codex/**"
       - "plugins/claude-code/**"
+      - "plugins/cursor/**"
   pull_request:
     paths:
       - ".github/workflows/windows-plugin-canary.yml"
+      - "plugins/capabilities.json"
       - "plugins/executor/**"
       - "plugins/codex/**"
       - "plugins/claude-code/**"
+      - "plugins/cursor/**"
 
 permissions:
   contents: read
@@ -59,17 +63,22 @@ jobs:
         run: npm ci --ignore-scripts --prefix plugins/executor
       - name: Install native host CLIs
         run: npm install --global @openai/codex @anthropic-ai/claude-code
-      - name: Verify native host CLIs
+      - name: Verify Codex CLI
         run: |
           codex --version
-          claude --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "Codex command: $((Get-Command codex).Source)"
-          "Claude command: $((Get-Command claude).Source)"
-      - name: Run managed-client bootstrap and route canaries
-        timeout-minutes: 3
+      - name: Verify Claude CLI
         run: |
-          node plugins/executor/tests/windows-managed-client-canary.mjs
-          node plugins/executor/tests/windows-managed-client-route-canary.mjs
+          claude --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "Claude command: $((Get-Command claude).Source)"
+      - name: Run managed-client bootstrap canary
+        timeout-minutes: 3
+        run: node plugins/executor/tests/windows-managed-client-canary.mjs
+      - name: Run managed-client route canary
+        timeout-minutes: 3
+        run: node plugins/executor/tests/windows-managed-client-route-canary.mjs
       - name: Prove secretless browser onboarding
         timeout-minutes: 2
         env:
@@ -81,6 +90,24 @@ jobs:
           STATEWRIGHT_API_KEY: ${{ secrets.STATEWRIGHT_PLUGIN_CANARY_API_KEY }}
           STATEWRIGHT_GATEWAY_URL: https://mcp.statewright.ai
         run: node plugins/executor/tests/windows-managed-client-live-gateway-canary.mjs
+      - name: Submit Codex adoption telemetry event
+        if: github.event_name != 'pull_request'
+        env:
+          STATEWRIGHT_API_KEY: ${{ secrets.STATEWRIGHT_PLUGIN_CANARY_API_KEY }}
+          STATEWRIGHT_PB_URL: https://statewright.ai
+          STATEWRIGHT_PLUGIN_PRODUCTION_CANARY: "1"
+        run: |
+          $codexVersion = node -p "require('./plugins/capabilities.json').plugins.codex.version"
+          node plugins/executor/tests/plugin-adoption-telemetry-canary.mjs codex $codexVersion
+      - name: Submit Claude adoption telemetry event
+        if: github.event_name != 'pull_request'
+        env:
+          STATEWRIGHT_API_KEY: ${{ secrets.STATEWRIGHT_PLUGIN_CANARY_API_KEY }}
+          STATEWRIGHT_PB_URL: https://statewright.ai
+          STATEWRIGHT_PLUGIN_PRODUCTION_CANARY: "1"
+        run: |
+          $claudeVersion = node -p "require('./plugins/capabilities.json').plugins.claude.version"
+          node plugins/executor/tests/plugin-adoption-telemetry-canary.mjs claude $claudeVersion
       - name: Record verification boundary
         if: always()
         env:
@@ -97,9 +124,9 @@ jobs:
           @'
           This job proves that a Windows-hosted Codex and Claude installation is discovered by the Statewright managed-client bootstrap, receives callable Windows shims, and is enabled in Statewright configuration. It executes the real npm-installed `codex.cmd` and `claude.cmd` launchers through the managed supervisor, then verifies fresh PowerShell profile activation, explicit cmd.exe PATH activation, and native-command restoration after uninstall.
 
-          It also proves that the managed supervisor can run a Windows .cmd launcher through a deterministic Codex route/restart cycle while preserving the quoted route configuration, full continuation prompt, bridge, managed identity, and control-directory lifecycle.
+          It also proves that the managed supervisor can run a Windows .cmd launcher through a deterministic Codex route/restart cycle while preserving the quoted route configuration, full continuation prompt, bridge, managed identity, and control-directory lifecycle. Codex, Claude Code, and Cursor exercise their secretless PowerShell browser-launch path.
 
-          On trusted `main` pushes and manual dispatches, it also authenticates the executor-owned loopback bridge to production and performs MCP initialization, `tools/list`, and the non-mutating `statewright_get_status` call. A manual source must resolve inside trusted `main` history before the secret-bearing step runs. Pull requests exercise only secretless bootstrap and routing. The key is scoped to the production step and is never exposed to a child host process.
+          On trusted `main` pushes and manual dispatches, it also authenticates the executor-owned loopback bridge to production and performs MCP initialization, `tools/list`, and the non-mutating `statewright_get_status` call. Separate steps then submit bounded Codex and Claude Code `ci_canary` adoption events and require explicit endpoint acknowledgements. A manual source must resolve inside trusted `main` history before the secret-bearing steps run. Pull requests exercise only secretless bootstrap and routing. The key is scoped to production-only steps and is never exposed to a child host process.
 
           This does not claim an authenticated interactive Codex or Claude vendor session. That would require vendor credentials and an interactive Windows canary.
           '@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY

@@ -148,7 +148,7 @@ async function defaultSend({ endpoint, dsn, event, environment }) {
 }
 
 // src/hook.ts
-var errorReporter = createErrorReporter({ plugin: "omx", version: "0.3.0" });
+var errorReporter = createErrorReporter({ plugin: "omx", version: "0.1.0" });
 errorReporter.installProcessHandlers();
 var SYSTEM_TOOLS = /* @__PURE__ */ new Set([
   "TodoRead",
@@ -392,6 +392,33 @@ async function gwCall(gwUrl, apiKey, toolName, args = {}) {
     return text ? JSON.parse(text) : null;
   } catch {
     return null;
+  }
+}
+async function callStatewrightGateway(gwUrl, apiKey, toolName, args = {}) {
+  return gwCall(gwUrl, apiKey, toolName, args);
+}
+async function initializeStatewrightGateway(gwUrl, apiKey) {
+  try {
+    const resp = await fetch(`${gwUrl}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 0,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "statewright-omx", version: "0.1.0" }
+        }
+      }),
+      signal: AbortSignal.timeout(8e3)
+    });
+    if (!resp.ok) return false;
+    const body = await resp.json();
+    return !body.error;
+  } catch {
+    return false;
   }
 }
 async function adapterCall(opts, endpoint, body) {
@@ -1065,6 +1092,7 @@ if (isMainModule) {
   });
 }
 export {
+  callStatewrightGateway,
   checkInterrupts,
   checkToolAllowed,
   classifyBashCommand,
@@ -1073,5 +1101,6 @@ export {
   handlePostTool,
   handlePreTool,
   handleStop,
-  handleUserPrompt
+  handleUserPrompt,
+  initializeStatewrightGateway
 };

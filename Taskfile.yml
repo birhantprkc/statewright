@@ -31,7 +31,7 @@ tasks:
       - node plugins/claude-code/scripts/sync-runtime.mjs --check
 
   test:plugin-release:
-    desc: "Run the complete local validation gate for a Codex/Claude plugin release"
+    desc: "Run the complete local validation gate for every supported plugin release"
     cmds:
       - node plugins/executor/scripts/sync-error-reporting.mjs --check
       - node plugins/codex/scripts/sync-executor-core.mjs --check
@@ -41,9 +41,11 @@ tasks:
       - node --check plugins/executor/tests/windows-managed-client-route-canary.mjs
       - node --check plugins/executor/tests/windows-managed-client-live-gateway-canary.mjs
       - node --check plugins/executor/tests/windows-plugin-browser-onboarding-canary.mjs
+      - node --check plugins/executor/tests/plugin-adoption-telemetry-canary.mjs
       - node --test plugins/executor/tests/*.test.mjs
       - node --test plugins/codex/tests/*.test.mjs
       - node --test plugins/claude-code/tests/*.test.mjs
+      - node --test plugins/cursor/tests/*.test.mjs
       - npm test --prefix plugins/pi
       - npm test --prefix plugins/opencode
       - npm test --prefix plugins/omx
@@ -52,6 +54,7 @@ tasks:
       - bash plugins/claude-code/tests/bash-discernment.test.sh
       - bash -n plugins/codex/hook.sh plugins/codex/client-id.sh plugins/codex/mcp-proxy.sh
       - bash -n plugins/claude-code/hook.sh plugins/claude-code/client-id.sh plugins/claude-code/mcp-proxy.sh plugins/claude-code/setup.sh
+      - bash -n plugins/cursor/hook.sh plugins/cursor/mcp-proxy.sh
       - git diff --check
 
   test:plugin-production-canary:unix:

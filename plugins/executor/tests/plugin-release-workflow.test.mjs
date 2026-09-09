@@ -40,12 +40,24 @@ function githubClient({ branchSha = SOURCE_SHA, jobs = successfulJobs(), runs = 
 
 function successfulJobs() {
   return {
-    11: REQUIRED_WORKFLOWS[0].requiredJobs.map((name) => ({ name, conclusion: "success", steps: [] })),
+    11: REQUIRED_WORKFLOWS[0].requiredJobs.map((name) => ({
+      name,
+      conclusion: "success",
+      steps: [{ name: "Submit plugin adoption telemetry event", conclusion: "success" }],
+    })),
     12: [{
       name: "Codex and Claude managed-client bootstrap",
       conclusion: "success",
-      steps: [{ name: "Run authenticated production gateway canary", conclusion: "success" }],
+      steps: [
+        { name: "Run managed-client bootstrap canary", conclusion: "success" },
+        { name: "Run managed-client route canary", conclusion: "success" },
+        { name: "Prove secretless browser onboarding", conclusion: "success" },
+        { name: "Run authenticated production gateway canary", conclusion: "success" },
+        { name: "Submit Codex adoption telemetry event", conclusion: "success" },
+        { name: "Submit Claude adoption telemetry event", conclusion: "success" },
+      ],
     }],
+    13: [{ name: "Plugin contract matrix", conclusion: "success", steps: [] }],
   };
 }
 
@@ -53,6 +65,7 @@ function successfulRuns(event = "push") {
   return {
     "plugin-production-canary.yml": [{ id: 11, event, conclusion: "success", html_url: "https://example.test/unix" }],
     "windows-plugin-canary.yml": [{ id: 12, event, conclusion: "success", html_url: "https://example.test/windows" }],
+    "ci.yml": [{ id: 13, event, conclusion: "success", html_url: "https://example.test/ci" }],
   };
 }
 
@@ -70,6 +83,7 @@ test("plugin release workflow resolves distinct names and curated notes", async 
     resolve(root, ".github/workflows/windows-plugin-canary.yml"),
     "utf8",
   );
+  const ci = await readFile(resolve(root, ".github/workflows/ci.yml"), "utf8");
   const windowsRouteCanary = await readFile(
     resolve(root, "plugins/executor/tests/windows-managed-client-route-canary.mjs"),
     "utf8",
@@ -99,13 +113,15 @@ test("plugin release workflow resolves distinct names and curated notes", async 
   assert.match(workflow, /await requirePluginCanaries\(/);
   assert.match(workflow, /artifact-smoke:\n\s+needs: package/);
   assert.match(workflow, /name: Smoke packaged plugin against production/);
+  assert.match(workflow, /name: Submit packaged plugin adoption telemetry event/);
   assert.match(workflow, /uses: actions\/attest@v4/);
   assert.match(workflow, /attestations: write/);
   assert.match(workflow, /id-token: write/);
   assert.match(workflow, /STATEWRIGHT_PLUGIN_ROOT: \${{ runner\.temp }}\/plugin-candidate/);
   assert.match(workflow, /publish:\n\s+needs: \[package, artifact-smoke\]/);
   assert.match(windowsCanary, /push:\n\s+branches: \[main\]/);
-  assert.match(windowsCanary, /name: Run managed-client bootstrap and route canaries\n\s+timeout-minutes: 3/);
+  assert.match(windowsCanary, /name: Run managed-client bootstrap canary\n\s+timeout-minutes: 3/);
+  assert.match(windowsCanary, /name: Run managed-client route canary\n\s+timeout-minutes: 3/);
   assert.match(
     windowsCanary,
     /name: Prove secretless browser onboarding[\s\S]*STATEWRIGHT_API_KEY: ""[\s\S]*windows-plugin-browser-onboarding-canary\.mjs/,
@@ -120,15 +136,21 @@ test("plugin release workflow resolves distinct names and curated notes", async 
     "secretless onboarding must run before the production secret enters a step environment",
   );
   assert.match(windowsCanary, /STATEWRIGHT_API_KEY: \$\{\{ secrets\.STATEWRIGHT_PLUGIN_CANARY_API_KEY \}\}/);
+  assert.match(ci, /plugin-contracts:/);
+  assert.match(ci, /name: Plugin contract matrix/);
+  assert.match(ci, /task test:plugin-release/);
   assert.match(windowsCanary, /release_ref:/);
   assert.match(windowsCanary, /git merge-base --is-ancestor HEAD origin\/main/);
   assert.match(unixCanary, /release_ref:/);
   assert.match(unixCanary, /plugin: \${{ fromJSON\(/);
   assert.match(unixCanary, /git merge-base --is-ancestor HEAD origin\/main/);
+  assert.match(unixCanary, /name: Submit plugin adoption telemetry event/);
+  assert.match(unixCanary, /plugin-adoption-telemetry-canary\.mjs/);
   assert.doesNotMatch(unixCanary, /\bomp\b/);
   assert.match(versionCanary, /evidence_mode:/);
   assert.match(versionCanary, /release-artifact/);
   assert.match(versionCanary, /release_ref is not part of trusted main history/);
+  assert.match(versionCanary, /name: Submit requested plugin adoption telemetry event/);
   assert.match(versionCanary, /codex:codex-v\*/);
   assert.match(versionCanary, /claude:claude-v\*/);
   assert.match(versionCanary, /gh attestation verify/);
@@ -161,8 +183,8 @@ test("release gate accepts successful exact-commit hosted canaries", async () =>
     core: { info: (message) => messages.push(message) },
     sourceSha: SOURCE_SHA,
   });
-  assert.deepEqual(evidence.map((item) => item.runId), [11, 12]);
-  assert.equal(messages.length, 2);
+  assert.deepEqual(evidence.map((item) => item.runId), [11, 12, 13]);
+  assert.equal(messages.length, 3);
 });
 
 test("release gate rejects a tag that is not current main", async () => {
@@ -213,7 +235,7 @@ test("release gate rejects a false-green Unix matrix with a missing job", async 
 
 test("release gate rejects a skipped Windows production step", async () => {
   const jobs = successfulJobs();
-  jobs[12][0].steps[0].conclusion = "skipped";
+  jobs[12][0].steps[3].conclusion = "skipped";
   await assert.rejects(
     requirePluginCanaries({
       github: githubClient({ jobs, runs: successfulRuns() }),
@@ -225,14 +247,61 @@ test("release gate rejects a skipped Windows production step", async () => {
   );
 });
 
+test("release gate rejects a Unix matrix job without a telemetry acknowledgement", async () => {
+  const jobs = successfulJobs();
+  jobs[11][0].steps[0].conclusion = "skipped";
+  await assert.rejects(
+    requirePluginCanaries({
+      github: githubClient({ jobs, runs: successfulRuns() }),
+      context: { repo: { owner: "statewright", repo: "statewright" } },
+      core: { info() {} },
+      sourceSha: SOURCE_SHA,
+    }),
+    /lacks successful step Submit plugin adoption telemetry event/,
+  );
+});
+
+test("release gate rejects a skipped Windows secretless onboarding step", async () => {
+  const jobs = successfulJobs();
+  jobs[12][0].steps[2].conclusion = "skipped";
+  await assert.rejects(
+    requirePluginCanaries({
+      github: githubClient({ jobs, runs: successfulRuns() }),
+      context: { repo: { owner: "statewright", repo: "statewright" } },
+      core: { info() {} },
+      sourceSha: SOURCE_SHA,
+    }),
+    /lacks successful step Prove secretless browser onboarding/,
+  );
+});
+
+test("release gate rejects an earlier failed Windows native command even when a later step succeeds", async () => {
+  for (const failedStep of [
+    "Run managed-client bootstrap canary",
+    "Submit Codex adoption telemetry event",
+  ]) {
+    const jobs = successfulJobs();
+    jobs[12][0].steps.find((step) => step.name === failedStep).conclusion = "failure";
+    await assert.rejects(
+      requirePluginCanaries({
+        github: githubClient({ jobs, runs: successfulRuns() }),
+        context: { repo: { owner: "statewright", repo: "statewright" } },
+        core: { info() {} },
+        sourceSha: SOURCE_SHA,
+      }),
+      new RegExp(`lacks successful step ${failedStep}`),
+    );
+  }
+});
+
 test("release gate ignores a newer incomplete push when complete evidence exists", async () => {
   const runs = successfulRuns();
   runs["plugin-production-canary.yml"] = [
-    { id: 13, event: "push", conclusion: "success", html_url: "https://example.test/partial" },
+    { id: 14, event: "push", conclusion: "success", html_url: "https://example.test/partial" },
     ...runs["plugin-production-canary.yml"],
   ];
   const jobs = successfulJobs();
-  jobs[13] = jobs[11].slice(0, 1);
+  jobs[14] = jobs[11].slice(0, 1);
   const evidence = await requirePluginCanaries({
     github: githubClient({ jobs, runs }),
     context: { repo: { owner: "statewright", repo: "statewright" } },

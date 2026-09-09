@@ -18,3 +18,30 @@ jobs:
         run: cargo test --workspace
       - name: Build gateway
         run: cargo build --release -p statewright-mcp-gateway
+
+  plugin-contracts:
+    name: Plugin contract matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            plugins/executor/package-lock.json
+            plugins/codex/package-lock.json
+            plugins/pi/package-lock.json
+            plugins/opencode/package-lock.json
+            plugins/omx/package-lock.json
+      - name: Install plugin dependencies
+        run: |
+          npm ci --ignore-scripts --prefix plugins/executor
+          npm ci --ignore-scripts --prefix plugins/codex
+          npm ci --ignore-scripts --prefix plugins/pi
+          npm ci --ignore-scripts --prefix plugins/opencode
+          npm ci --ignore-scripts --prefix plugins/omx
+      - name: Install Task
+        run: go install github.com/go-task/task/v3/cmd/task@v3.39.2
+      - name: Run plugin release contracts
+        run: "$(go env GOPATH)/bin/task test:plugin-release"

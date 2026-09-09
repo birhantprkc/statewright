@@ -18,7 +18,7 @@ import { homedir } from "node:os"
 import { minimatch } from "minimatch"
 import { createErrorReporter, isExpectedPluginError } from "./error-reporting.mjs"
 
-const errorReporter = createErrorReporter({ plugin: "omx", version: "0.3.0" })
+const errorReporter = createErrorReporter({ plugin: "omx", version: "0.1.0" })
 errorReporter.installProcessHandlers()
 
 // --- Types ---
@@ -481,7 +481,7 @@ export async function initializeStatewrightGateway(
         params: {
           protocolVersion: "2024-11-05",
           capabilities: {},
-          clientInfo: { name: "statewright-omx", version: "0.3.0" },
+          clientInfo: { name: "statewright-omx", version: "0.1.0" },
         },
       }),
       signal: AbortSignal.timeout(8_000),

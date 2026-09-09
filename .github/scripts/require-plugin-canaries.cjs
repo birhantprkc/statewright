@@ -3,7 +3,13 @@
 const UNIX_PLUGINS = Object.freeze(["codex", "claude", "cursor", "pi", "opencode", "omx"]);
 const UNIX_OPERATING_SYSTEMS = Object.freeze(["ubuntu-24.04", "macos-14"]);
 const WINDOWS_JOB = "Codex and Claude managed-client bootstrap";
+const ADOPTION_TELEMETRY_STEP = "Submit plugin adoption telemetry event";
+const WINDOWS_ONBOARDING_STEP = "Prove secretless browser onboarding";
 const WINDOWS_PRODUCTION_STEP = "Run authenticated production gateway canary";
+const WINDOWS_BOOTSTRAP_STEP = "Run managed-client bootstrap canary";
+const WINDOWS_ROUTE_STEP = "Run managed-client route canary";
+const WINDOWS_CODEX_TELEMETRY_STEP = "Submit Codex adoption telemetry event";
+const WINDOWS_CLAUDE_TELEMETRY_STEP = "Submit Claude adoption telemetry event";
 
 const REQUIRED_WORKFLOWS = Object.freeze([
   {
@@ -11,12 +17,29 @@ const REQUIRED_WORKFLOWS = Object.freeze([
     label: "macOS/Linux production matrix",
     requiredJobs: UNIX_PLUGINS.flatMap((plugin) =>
       UNIX_OPERATING_SYSTEMS.map((operatingSystem) => `${plugin} on ${operatingSystem}`)),
+    requiredSteps: UNIX_PLUGINS.flatMap((plugin) =>
+      UNIX_OPERATING_SYSTEMS.map((operatingSystem) => ({
+        job: `${plugin} on ${operatingSystem}`,
+        step: ADOPTION_TELEMETRY_STEP,
+      }))),
   },
   {
     workflowId: "windows-plugin-canary.yml",
     label: "Windows production/bootstrap",
     requiredJobs: [WINDOWS_JOB],
-    requiredSteps: [{ job: WINDOWS_JOB, step: WINDOWS_PRODUCTION_STEP }],
+    requiredSteps: [
+      { job: WINDOWS_JOB, step: WINDOWS_BOOTSTRAP_STEP },
+      { job: WINDOWS_JOB, step: WINDOWS_ROUTE_STEP },
+      { job: WINDOWS_JOB, step: WINDOWS_ONBOARDING_STEP },
+      { job: WINDOWS_JOB, step: WINDOWS_PRODUCTION_STEP },
+      { job: WINDOWS_JOB, step: WINDOWS_CODEX_TELEMETRY_STEP },
+      { job: WINDOWS_JOB, step: WINDOWS_CLAUDE_TELEMETRY_STEP },
+    ],
+  },
+  {
+    workflowId: "ci.yml",
+    label: "plugin contract matrix",
+    requiredJobs: ["Plugin contract matrix"],
   },
 ]);
 

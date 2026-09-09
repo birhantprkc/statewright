@@ -139,6 +139,13 @@ jobs:
               npm test --prefix "$STATEWRIGHT_PLUGIN_ROOT/plugins/${{ inputs.plugin }}" -- --run src/production-gateway-canary.test.ts
               ;;
           esac
+      - name: Submit requested plugin adoption telemetry event
+        env:
+          PLUGIN: ${{ inputs.plugin }}
+          STATEWRIGHT_API_KEY: ${{ secrets.STATEWRIGHT_PLUGIN_CANARY_API_KEY }}
+          STATEWRIGHT_PB_URL: https://statewright.ai
+          STATEWRIGHT_PLUGIN_PRODUCTION_CANARY: "1"
+        run: node control/plugins/executor/tests/plugin-adoption-telemetry-canary.mjs "$PLUGIN"
       - name: Record version evidence
         if: always()
         env:
@@ -154,5 +161,5 @@ jobs:
             printf -- '- Resolved source SHA: `%s`\n' "$SOURCE_SHA"
             printf -- '- Artifact SHA-256: `%s`\n' "${ARTIFACT_DIGEST:-not-applicable}"
             printf -- '- Runner: `%s`\n\n' '${{ matrix.os }}'
-            printf '%s\n' 'This is a read-only production transport check. Source mode executes trusted source at the resolved SHA. Release-artifact mode executes the downloaded Codex or Claude ZIP. It does not prove an authenticated interactive vendor-host session.'
+            printf '%s\n' 'The production transport check is read-only. A following step submits one bounded `ci_canary` event for the exercised plugin version and requires an explicit endpoint acknowledgement. Source mode executes trusted source at the resolved SHA. Release-artifact mode executes the downloaded Codex or Claude ZIP. It does not prove database persistence, provider-token usage, or an authenticated interactive vendor-host session.'
           } >> "$GITHUB_STEP_SUMMARY"

@@ -54,6 +54,7 @@ function runProxy(proxyPath, environment) {
 const plugins = [
   ["codex", new URL("../../codex/mcp-proxy.sh", import.meta.url)],
   ["claude", new URL("../../claude-code/mcp-proxy.sh", import.meta.url)],
+  ["cursor", new URL("../../cursor/mcp-proxy.sh", import.meta.url)],
 ];
 
 for (const [name, proxyUrl] of plugins) {

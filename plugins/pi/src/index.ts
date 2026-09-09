@@ -341,7 +341,7 @@ async function gwInit(): Promise<boolean> {
         params: {
           protocolVersion: "2024-11-05",
           capabilities: {},
-          clientInfo: { name: "statewright-pi", version: "1.0" },
+          clientInfo: { name: "statewright-pi", version: PLUGIN_VERSION },
         },
       }),
       signal: AbortSignal.timeout(5000),

@@ -240,8 +240,8 @@ Point your agent at the [JSON schema](https://statewright.ai/workflow-schema.jso
 | [Claude Code](plugins/claude-code/) | 0.3.1 | Hooks + executor MCP bridge | Hard | Managed restart with forked session |
 | [Codex](plugins/codex/) | 0.3.1 | App-server hooks + shared executor bridge | Hard | Managed restart of the same thread |
 | [Oh My Codex](plugins/omx/) | 0.1.x | Native hooks + executor MCP bridge | Hard | Startup |
-| [Pi](plugins/pi/) | 0.2.0 | Native extension + executor MCP bridge | Hard* | Live |
-| [OpenCode](plugins/opencode/) | 0.2.0 | Native plugin + executor MCP bridge | Hard | Live |
+| [Pi](plugins/pi/) | 0.3.0 | Native extension + executor MCP bridge | Hard* | Live |
+| [OpenCode](plugins/opencode/) | 0.3.0 | Native plugin + executor MCP bridge | Hard | Live |
 | [Cursor](plugins/cursor/) | 0.2.0 | Native hooks + executor MCP bridge | Hard in executor mode | Resume same chat |
 
 *\*Pi includes tool name normalization and tool-call recovery for local models (Ollama, LM Studio).*

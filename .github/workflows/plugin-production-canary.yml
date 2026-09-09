@@ -25,6 +25,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/plugin-production-canary.yml"
+      - "plugins/capabilities.json"
       - "plugins/executor/**"
       - "plugins/codex/**"
       - "plugins/claude-code/**"
@@ -101,6 +102,15 @@ jobs:
               npm test --prefix plugins/omx -- --run src/production-gateway-canary.test.ts
               ;;
           esac
+      - name: Submit plugin adoption telemetry event
+        env:
+          PLUGIN: ${{ matrix.plugin }}
+          STATEWRIGHT_API_KEY: ${{ secrets.STATEWRIGHT_PLUGIN_CANARY_API_KEY }}
+          STATEWRIGHT_PB_URL: https://statewright.ai
+          STATEWRIGHT_PLUGIN_PRODUCTION_CANARY: "1"
+        run: |
+          version=$(node -p "require('./plugins/capabilities.json').plugins[process.env.PLUGIN].version")
+          node plugins/executor/tests/plugin-adoption-telemetry-canary.mjs "$PLUGIN" "$version"
       - name: Record verification boundary
         if: always()
         env:
@@ -114,5 +124,5 @@ jobs:
             printf -- '- Requested ref: `%s`\n' "$REQUESTED_REF"
             printf -- '- Resolved source SHA: `%s`\n\n' "$SOURCE_SHA"
             printf '%s\n' 'This trusted-run-only job authenticates a dedicated isolated canary account to `mcp.statewright.ai`. Codex, Claude Code, and Cursor exercise MCP initialization, `tools/list`, and `statewright_get_status` through their actual stdio proxies. Pi and standalone OMX exercise initialization plus `statewright_get_status` through their direct clients. OpenCode relays `statewright_get_status` through its initialized executor-owned adapter bridge.' ''
-            printf '%s\n' 'The secret is step-scoped and this workflow has no pull-request trigger. The selected source must resolve inside trusted `main` history before the secret-bearing step runs. This proves source-transport compatibility on macOS and Linux; it does not claim a packaged artifact or authenticated interactive vendor session.'
+            printf '%s\n' 'The secret is step-scoped and this workflow has no pull-request trigger. The selected source must resolve inside trusted `main` history before the secret-bearing steps run. The transport check is read-only. The following step submits one bounded `ci_canary` adoption event and requires an explicit endpoint acknowledgement. This proves source-transport compatibility and endpoint acceptance on macOS and Linux; it does not claim database persistence, a packaged artifact, provider-token usage, or an authenticated interactive vendor session.'
           } >> "$GITHUB_STEP_SUMMARY"
