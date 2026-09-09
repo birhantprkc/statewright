@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { chmod, cp, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdtemp, readdir, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { startCodexAppServerRouteProxy } from "./codex-app-server-route-proxy.mjs";
@@ -268,13 +268,18 @@ export async function startCodexAppServerRuntime({
           await reporter.report(error, { mechanism: "shutdown", host: "codex", operation: "app_server_proxy" }).catch(() => {});
         });
         await stopOwnedAppServer(appServer, appServerClosed, shutdownGraceMs);
-        await rm(appServerHome, { recursive: true, force: true });
+        // Keep the isolated home addressable after shutdown. A native TUI can
+        // still be holding the App Server URL while the owned server exits;
+        // deleting the projection turns a recoverable disconnect into
+        // Codex's misleading `no rollout found` resume error. Its entries are
+        // symlinked to the canonical home and can be replaced next launch.
       },
     };
   } catch (error) {
     closing = true;
     await stopOwnedAppServer(appServer, appServerClosed, shutdownGraceMs);
-    await rm(appServerHome, { recursive: true, force: true });
+    // Preserve the projection for a TUI that may still be unwinding after a
+    // failed startup; see the normal close path above.
     throw error;
   }
 }

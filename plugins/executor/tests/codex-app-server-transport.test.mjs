@@ -58,6 +58,8 @@ test("App Server runtime confirms its owned child exits before close completes",
     const pid = Number(await readFile(pidPath, "utf8"));
     await runtime.close();
     assert.throws(() => process.kill(pid, 0));
+    const retainedHomes = (await readdir(tmpdir())).filter((entry) => entry.startsWith("statewright-swc_shutdown_test-app-server-"));
+    assert.ok(retainedHomes.length >= 1, "the isolated home must remain addressable after shutdown");
   } finally {
     await rm(home, { recursive: true, force: true });
   }
