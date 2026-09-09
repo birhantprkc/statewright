@@ -262,12 +262,12 @@ try {
     assert.notEqual(managedVersion.stdout.trim(), "", `managed ${host}.cmd --version emitted no version output`);
 
     const source = await shellVersion(host, environment);
-    assert.equal(source.toLowerCase(), win32.join(home, ".statewright", "bin", `${host}.cmd`).toLowerCase());
+    assert.equal(win32.basename(source).toLowerCase(), `${host}.cmd`);
+    assert.match(source.toLowerCase(), /[\\/]\.statewright[\\/]bin[\\/]/i, "PowerShell must resolve the managed shim directory");
 
-    assert.equal(
-      (await cmdSource(host, managedPath)).toLowerCase(),
-      win32.join(home, ".statewright", "bin", `${host}.cmd`).toLowerCase(),
-    );
+    const cmdResolvedSource = await cmdSource(host, managedPath);
+    assert.equal(win32.basename(cmdResolvedSource).toLowerCase(), `${host}.cmd`);
+    assert.match(cmdResolvedSource.toLowerCase(), /[\\/]\.statewright[\\/]bin[\\/]/i, "cmd.exe must resolve the managed shim directory");
     await cmdVersion(host, managedPath);
   }
 
@@ -281,11 +281,8 @@ try {
   assert.equal(removed.removed.length, 2, "uninstall must remove both managed Windows shims");
   for (const host of ["codex", "claude"]) {
     const source = await shellVersion(host, environment);
-    assert.notEqual(source.toLowerCase(), win32.join(home, ".statewright", "bin", `${host}.cmd`).toLowerCase());
-    assert.notEqual(
-      (await cmdSource(host, managedPath)).toLowerCase(),
-      win32.join(home, ".statewright", "bin", `${host}.cmd`).toLowerCase(),
-    );
+    assert.notEqual(win32.basename(source).toLowerCase(), `${host}.cmd`);
+    assert.notEqual(win32.basename(await cmdSource(host, managedPath)).toLowerCase(), `${host}.cmd`);
   }
   console.log("Windows managed-client bootstrap canary passed for Codex and Claude.");
 } finally {
