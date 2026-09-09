@@ -45,7 +45,7 @@ async function killProjectAppServers({ cwd = process.cwd(), home = homedir(), al
     try {
       const manifestPath = join(root, entry.name, "manifest.json");
       const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-      if (manifest.cwd === cwd && Number.isInteger(manifest.pid)) matches.push({ ...manifest, manifestPath });
+      if ((manifest.cwd === cwd || manifest.threadListCwd === cwd) && Number.isInteger(manifest.pid)) matches.push({ ...manifest, manifestPath });
     } catch {}
   }
   if (!matches.length) { process.stdout.write(`[statewright] no managed App Server found for ${cwd}\n`); return; }
