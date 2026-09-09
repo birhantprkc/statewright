@@ -603,7 +603,7 @@ export async function guardCodexResumeHistory({
     }
     const classified = classifyInspection(inspection);
     if (classified) return classified;
-    if (mode === "guard") throw new CodexHistoryIntegrityError("Statewright detected duplicate restart metadata and is refusing to resume from a stale paginated projection. Re-run once with STATEWRIGHT_CODEX_HISTORY_REPAIR=auto after exiting every writer for this thread.", { code: "CODEX_HISTORY_REPAIR_REQUIRED", inspection });
+    if (mode === "guard") throw new CodexHistoryIntegrityError(`Statewright detected duplicate restart metadata and is refusing to resume from a stale paginated projection. Re-run once with STATEWRIGHT_CODEX_HISTORY_REPAIR=auto after exiting every writer for this thread. If a resident App Server is stale for this project, run: statewright-managed-client --kill-app-server (cwd: ${cwd})`, { code: "CODEX_HISTORY_REPAIR_REQUIRED", inspection });
     return await withWriterLock({ home, codexHome: storage.codexHome, writerLockRoot: storage.writerLockRoot, sessionId, environment }, async () => {
       const lockedInspection = await inspectCodexHistory({ home, codexHome: storage.codexHome, sessionId });
       const lockedClassification = classifyInspection(lockedInspection);
