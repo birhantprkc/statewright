@@ -66,6 +66,57 @@ test("unrouted states inherit the active route", () => {
   assert.equal(route.source, "inherited");
 });
 
+test("model ladders select the first entry advertised by the active provider catalog", () => {
+  const route = resolveStateRoute({
+    state: "build",
+    model: "local_compatible/local-code-model",
+    model_ladder: [
+      { model: "local_compatible/local-code-model", thinking_level: "low" },
+      { model: "openai-codex/gpt-5.6-luna", thinking_level: "low" },
+    ],
+  }, catalog, resolveFallbackRoute(catalog), "openai");
+  assert.equal(route.model, "gpt-5.6-luna");
+  assert.equal(route.effort, "low");
+  assert.equal(route.requestedModel, "openai-codex/gpt-5.6-luna");
+  assert.equal(route.source, "state-ladder");
+});
+
+test("provider-qualified local ladder models match native catalog ids", () => {
+  const localCatalog = normalizeCatalog([{
+    id: "local-code-model",
+    model: "local-code-model",
+    defaultReasoningEffort: "low",
+    supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+  }]);
+  const route = resolveStateRoute({
+    state: "build",
+    model_ladder: [
+      { model: "local_compatible/local-code-model", thinking_level: "low" },
+      { model: "openai-codex/gpt-5.6-luna", thinking_level: "low" },
+    ],
+  }, localCatalog, { model: "local-code-model", effort: "low" }, "local_compatible");
+  assert.equal(route.model, "local-code-model");
+  assert.equal(route.requestedModel, "local_compatible/local-code-model");
+});
+
+test("provider-qualified ladder entries cannot collide through a shared bare model id", () => {
+  const sharedCatalog = normalizeCatalog([{
+    id: "shared-model",
+    model: "shared-model",
+    defaultReasoningEffort: "low",
+    supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+  }]);
+  const route = resolveStateRoute({
+    state: "build",
+    model_ladder: [
+      { model: "local_compatible/shared-model", thinking_level: "low" },
+      { model: "openai-codex/shared-model", thinking_level: "low" },
+    ],
+  }, sharedCatalog, { model: "shared-model", effort: "low" }, "openai");
+  assert.equal(route.model, "shared-model");
+  assert.equal(route.requestedModel, "openai-codex/shared-model");
+});
+
 test("unknown state models fail closed", () => {
   assert.throws(
     () =>

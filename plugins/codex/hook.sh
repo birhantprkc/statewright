@@ -286,7 +286,7 @@ emit_native_telemetry() {
 # never kills Codex itself; it only persists the authoritative next route.
 request_interactive_route_restart() {
   local state_json="$1"
-  local control_dir model effort request_path root_session_id registration
+  local control_dir model effort model_ladder request_path root_session_id registration
   control_dir="${STATEWRIGHT_ROUTE_CONTROL_DIR:-}"
   [ -n "$control_dir" ] || return 0
   # One-shot Codex children may inherit a managed parent's route directory when
@@ -302,6 +302,7 @@ request_interactive_route_restart() {
   [ -n "$root_session_id" ] && [ "$HOOK_SESSION" = "$root_session_id" ] || return 0
   model=$(echo "$state_json" | jq -r '.model // empty' 2>/dev/null || true)
   effort=$(echo "$state_json" | jq -r '.thinking_level // empty' 2>/dev/null || true)
+  model_ladder=$(echo "$state_json" | jq -c 'if (.model_ladder | type) == "array" then .model_ladder else [] end' 2>/dev/null || echo '[]')
   mkdir -p "$control_dir" || return 0
   request_path="$control_dir/$(date +%s%N)-${HOOK_SESSION:-unknown}.route.json"
   jq -n \
@@ -312,7 +313,8 @@ request_interactive_route_restart() {
     --arg state "$(echo "$state_json" | jq -r '.state // empty' 2>/dev/null || true)" \
     --arg model "$model" \
     --arg effort "$effort" \
-    '{session_id: $session_id, root_session_id: $root_session_id, client_id: $client_id, run_id: $run_id, state: $state, model: $model, effort: $effort}' \
+    --argjson model_ladder "$model_ladder" \
+    '{session_id: $session_id, root_session_id: $root_session_id, client_id: $client_id, run_id: $run_id, state: $state, model: $model, effort: $effort, model_ladder: $model_ladder}' \
     > "$request_path.tmp" && mv "$request_path.tmp" "$request_path"
 }
 

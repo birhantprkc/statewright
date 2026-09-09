@@ -6,12 +6,12 @@
 #
 # Example:
 #   ./deepswe-run.sh /tmp/deep-swe/tasks/psd-tools-blend-range-api \
-#     https://qwen2-5-coder-14b.ollama.casa.enhasa.cloud/v1 qwen3:8b 25
+#     http://127.0.0.1:11434/v1 qwen3:8b 25
 
 set -euo pipefail
 
 TASK_DIR="${1:?Usage: deepswe-run.sh <task_dir> [model_url] [model_name] [max_steps] [workflow]}"
-MODEL_URL="${2:-https://qwen2-5-coder-14b.ollama.casa.enhasa.cloud/v1}"
+MODEL_URL="${2:-http://127.0.0.1:11434/v1}"
 MODEL_NAME="${3:-qwen3:8b}"
 MAX_STEPS="${4:-50}"
 WORKFLOW="${5:-bugfix}"  # bugfix or tdd-greenfield

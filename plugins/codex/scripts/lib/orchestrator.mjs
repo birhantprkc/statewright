@@ -145,6 +145,7 @@ export class StatewrightCodexOrchestrator extends EventEmitter {
     this.serverName = null;
     this.catalog = [];
     this.route = null;
+    this.activeProvider = null;
     this.lastState = null;
     this.budgetLedger = new StateBudgetLedger();
   }
@@ -166,6 +167,7 @@ export class StatewrightCodexOrchestrator extends EventEmitter {
       this.fallbackEffort,
     );
     this.thread = await this.openThread();
+    this.activeProvider = this.thread.modelProvider ?? null;
     await this.telemetry("session_started", {
       thread_id: this.thread.id,
       session_id: this.thread.sessionId ?? null,
@@ -361,7 +363,7 @@ export class StatewrightCodexOrchestrator extends EventEmitter {
   }
 
   async selectRoute(state) {
-    const route = resolveStateRoute(state, this.catalog, this.route);
+    const route = resolveStateRoute(state, this.catalog, this.route, this.activeProvider);
     await this.telemetry("route_selected", {
       thread_id: this.thread.id,
       state: state.state ?? null,

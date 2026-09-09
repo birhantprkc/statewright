@@ -661,7 +661,7 @@ async function maybeDelegateDirectExecution(): Promise<string | null> {
     // Use the cycle tier (clamped to this state's ladder)
     const tier = Math.min(cycleTier, ladder.length - 1)
     const model = ladder[tier]?.model ?? stateCache.model ?? "devstral-small-2:24b"
-    const url = ladder[tier]?.url ?? "https://devstral-small-2-24b.ollama.casa.enhasa.cloud/v1"
+    const url = ladder[tier]?.url ?? "http://127.0.0.1:11434/v1"
 
     swLog(`direct_execution] state=${state} cycleTier=${cycleTier} model=${model}`)
 
@@ -2212,7 +2212,7 @@ export default async function statewrightExtension(pi: ExtensionAPI) {
       // This matches the Rust harness which parses JSON from text, not native tool calls.
       // Ollama sends BOTH — Pi reads tool_calls (only gets read), Rust reads content (gets everything).
       if (EXPERIMENTAL && isPluginOrchestrated() && createStream && currentModel?.provider?.startsWith("ollama") && currentModel.provider !== "ollama-text") {
-        const ollamaBaseUrl = (currentModel.baseUrl || `https://${currentModel.id.replace(":", "-")}.ollama.casa.enhasa.cloud/v1`).replace(/\/v1\/?$/, "").replace(/\/+$/, "")
+        const ollamaBaseUrl = (currentModel.baseUrl || "http://127.0.0.1:11434/v1").replace(/\/v1\/?$/, "").replace(/\/+$/, "")
         try {
           pi.registerProvider("ollama-text", {
             name: "Ollama (text-only, no native tool calls)",

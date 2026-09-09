@@ -936,7 +936,7 @@ mod tests {
         assert!(is_ollama_endpoint("http://localhost:11434/v1"));
         assert!(is_ollama_endpoint("http://127.0.0.1:11434/v1"));
         assert!(is_ollama_endpoint(
-            "https://qwen3-8b.ollama.casa.enhasa.cloud/v1"
+            "https://model.ollama.example.invalid/v1"
         ));
     }
 

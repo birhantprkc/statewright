@@ -36,12 +36,15 @@ export function normalizeCatalog(entries) {
   }));
 }
 
-function stripProvider(raw) {
-  const value = raw.trim();
-  for (const prefix of ["openai-codex/", "openai/"]) {
-    if (value.toLowerCase().startsWith(prefix)) return value.slice(prefix.length);
-  }
-  return value;
+function providerModel(raw) {
+  const value = String(raw ?? "").trim();
+  const slash = value.indexOf("/");
+  if (slash <= 0) return { provider: null, model: value };
+  const declared = value.slice(0, slash).trim().toLowerCase();
+  return {
+    provider: declared === "openai-codex" ? "openai" : declared,
+    model: value.slice(slash + 1),
+  };
 }
 
 function findFamily(catalog, family) {
@@ -51,10 +54,12 @@ function findFamily(catalog, family) {
   );
 }
 
-export function findModel(catalog, requested) {
+export function findModel(catalog, requested, activeProvider = null) {
   if (!requested) return null;
-  const stripped = stripProvider(requested);
-  const lower = stripped.toLowerCase();
+  const requestedRoute = providerModel(requested);
+  const activeRoute = providerModel(`${String(activeProvider ?? "").trim()}/_`);
+  if (requestedRoute.provider && activeRoute.provider && requestedRoute.provider !== activeRoute.provider) return null;
+  const lower = requestedRoute.model.toLowerCase();
 
   if (FAMILY_ALIASES.has(lower)) return findFamily(catalog, lower);
 
@@ -99,8 +104,9 @@ export function resolveFallbackRoute(catalog, requestedModel = "luna", requested
   };
 }
 
-export function resolveStateRoute(state, catalog, currentRoute) {
-  if (!state?.model) {
+export function resolveStateRoute(state, catalog, currentRoute, activeProvider = null) {
+  const ladder = Array.isArray(state?.model_ladder) ? state.model_ladder : [];
+  if (!state?.model && ladder.length === 0) {
     return {
       ...currentRoute,
       state: state?.state ?? null,
@@ -110,26 +116,37 @@ export function resolveStateRoute(state, catalog, currentRoute) {
     };
   }
 
-  const model = findModel(catalog, state.model);
+  const candidates = ladder.length > 0
+    ? ladder.map((entry) => typeof entry === "string" ? { model: entry } : entry).filter((entry) => entry?.model)
+    : [{ model: state.model, thinking_level: state.thinking_level }];
+  const selected = candidates.find((entry) => findModel(catalog, entry.model, activeProvider));
+  const requestedModel = state.model ?? candidates[0]?.model;
+  const model = selected ? findModel(catalog, selected.model, activeProvider) : null;
   if (!model) {
+    if (ladder.length === 0) {
+      throw new Error(
+        `Statewright requested model '${state.model}', but it is not in the live Codex model catalog. ` +
+          "Refusing to silently reroute the next state.",
+      );
+    }
     throw new Error(
-      `Statewright requested model '${state.model}', but it is not in the live Codex model catalog. ` +
+      `Statewright requested model route '${requestedModel}', but no model_ladder entry is in the live Codex model catalog. ` +
         "Refusing to silently reroute the next state.",
     );
   }
 
   const sameModel = model.id === currentRoute?.model;
   const desiredEffort =
-    state.thinking_level ?? (sameModel ? currentRoute?.effort : model.defaultEffort);
-  const effort = assertEffort(model, desiredEffort, state.model);
+    selected.thinking_level ?? selected.effort ?? state.thinking_level ?? (sameModel ? currentRoute?.effort : model.defaultEffort);
+  const effort = assertEffort(model, desiredEffort, selected.model);
 
   return {
     state: state.state ?? null,
     model: model.id,
     effort,
-    requestedModel: state.model,
-    requestedEffort: state.thinking_level ?? null,
-    source: "state",
+    requestedModel: selected.model,
+    requestedEffort: selected.thinking_level ?? selected.effort ?? state.thinking_level ?? null,
+    source: ladder.length > 0 ? "state-ladder" : "state",
   };
 }
 

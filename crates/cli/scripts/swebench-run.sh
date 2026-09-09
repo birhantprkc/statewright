@@ -5,12 +5,12 @@
 #   ./swebench-run.sh <instance_id> [model_url] [model_name]
 #
 # Example:
-#   ./swebench-run.sh sympy__sympy-20590 https://qwen3-8b.ollama.casa.enhasa.cloud/v1 qwen3:8b
+#   ./swebench-run.sh sympy__sympy-20590 http://127.0.0.1:11434/v1 qwen3:8b
 
 set -euo pipefail
 
 INSTANCE_ID="${1:?Usage: swebench-run.sh <instance_id> [model_url] [model_name]}"
-MODEL_URL="${2:-https://qwen2-5-coder-14b.ollama.casa.enhasa.cloud/v1}"
+MODEL_URL="${2:-http://127.0.0.1:11434/v1}"
 MODEL_NAME="${3:-qwen3:8b}"
 RUN_ID="${4:-statewright-$(date +%s)}"
 MAX_STEPS="${5:-25}"

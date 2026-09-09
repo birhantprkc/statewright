@@ -1,5 +1,6 @@
 import { WebSocket, WebSocketServer } from "ws";
 import { createServer } from "node:http";
+import { selectRouteForProvider } from "./model-ladder.mjs";
 
 function routeModel(model) {
   return String(model ?? "").replace(/^[^/]+\//, "").trim();
@@ -9,24 +10,25 @@ function sameRouteValue(actual, expected) {
   return String(actual ?? "").trim() === String(expected ?? "").trim();
 }
 
-export function applyRouteToTurnStart(message, route) {
+export function applyRouteToTurnStart(message, route, activeProvider = null) {
   if (message?.method !== "turn/start" || !route) return { message, receipt: null };
   const threadId = String(message.params?.threadId ?? "");
   const routeSessionId = String(route.session_id ?? "");
   if (!threadId || !routeSessionId || threadId !== routeSessionId) return { message, receipt: null };
-  const model = routeModel(route.model);
+  const selectedRoute = selectRouteForProvider(route, activeProvider);
+  const model = routeModel(selectedRoute.model);
   if (!model) throw new Error("Statewright App Server route is missing a model.");
   const params = { ...(message.params ?? {}), model };
-  if (route.effort) params.effort = route.effort;
+  if (selectedRoute.effort) params.effort = selectedRoute.effort;
   const routed = { ...message, params };
   return {
     message: routed,
     receipt: {
-      route,
+      route: selectedRoute,
       threadId,
-      requestedModel: String(route.model),
+      requestedModel: String(selectedRoute.model),
       effectiveModel: model,
-      effectiveEffort: route.effort ?? null,
+      effectiveEffort: selectedRoute.effort ?? null,
     },
   };
 }
@@ -98,9 +100,27 @@ export function clarifyActiveWriterResumeError(message) {
   };
 }
 
-function forwardWhenOpen(socket, payload) {
-  if (socket.readyState === WebSocket.OPEN) socket.send(payload);
-  else if (socket.readyState === WebSocket.CONNECTING) socket.once("open", () => socket.send(payload));
+export function forwardWhenOpen(socket, payload) {
+  return new Promise((resolveForward, rejectForward) => {
+    const send = () => socket.send(payload, (error) => error ? rejectForward(error) : resolveForward());
+    if (socket.readyState === WebSocket.OPEN) {
+      send();
+      return;
+    }
+    if (socket.readyState !== WebSocket.CONNECTING) {
+      rejectForward(new Error("Codex App Server upstream is not open."));
+      return;
+    }
+    const closed = () => rejectForward(new Error("Codex App Server upstream closed before forwarding."));
+    const failed = (error) => rejectForward(error);
+    socket.once("close", closed);
+    socket.once("error", failed);
+    socket.once("open", () => {
+      socket.off("close", closed);
+      socket.off("error", failed);
+      send();
+    });
+  });
 }
 
 export async function startCodexAppServerRouteProxy({
@@ -114,6 +134,7 @@ export async function startCodexAppServerRouteProxy({
   compactResume = true,
   resumeHistoryLimit = 4,
   threadListCwd = null,
+  forwardPayload = forwardWhenOpen,
   idleMs = 500,
   onIdle = async () => {},
 }) {
@@ -132,6 +153,14 @@ export async function startCodexAppServerRouteProxy({
   let closing = false;
   let idleTimer = null;
   let idleGeneration = 0;
+  let routeLease = Promise.resolve();
+  const acquireRouteLease = async () => {
+    const previous = routeLease;
+    let release;
+    routeLease = new Promise((resolveLease) => { release = resolveLease; });
+    await previous;
+    return release;
+  };
   const activeConnections = new Set();
   const idleEligible = () => !closing && everConnected && connectedClients === 0 && activeConnections.size === 0;
   const cancelIdle = () => {
@@ -165,9 +194,11 @@ export async function startCodexAppServerRouteProxy({
   server.on("connection", (downstream) => {
     const connection = Symbol("app-server-connection");
     const activeThreads = new Map();
+    const activeProviders = new Map();
     const pendingTurnStarts = new Map();
     const receipts = new Map();
     const requestMethods = new Map();
+    let protocolFailed = false;
     const syncActivity = () => {
       if (activeThreads.size > 0) activeConnections.add(connection);
       else activeConnections.delete(connection);
@@ -193,8 +224,14 @@ export async function startCodexAppServerRouteProxy({
     const upstream = new WebSocket(upstreamUrl);
     void onConnection({ upstreamUrl });
     downstream.on("message", async (raw) => {
+      if (protocolFailed) return;
       let payload = String(raw);
       let provisionalTurn = null;
+      let routeReceipt = null;
+      let acknowledgeRoute = null;
+      let releasePendingRoute = null;
+      let releaseRouteLease = null;
+      let routeForwarded = false;
       try {
         let message = JSON.parse(payload);
         void onConnection({ direction: "native_to_upstream", method: message.method ?? null });
@@ -205,21 +242,48 @@ export async function startCodexAppServerRouteProxy({
         payload = JSON.stringify(message);
         if (compacted) void onConnection({ direction: "native_to_upstream", method: `thread/resume [last ${resumeHistoryLimit} turns]` });
         if (message.method === "turn/start") {
+          releaseRouteLease = await acquireRouteLease();
+          if (protocolFailed || downstream.readyState !== WebSocket.OPEN) {
+            releaseRouteLease();
+            return;
+          }
           const threadId = String(message.params?.threadId ?? "");
           const requestId = message.id === undefined ? null : String(message.id);
           const reason = requestId === null ? Symbol("turn-start") : `turn-start:${requestId}`;
           provisionalTurn = { requestId, reason, threadId };
           addActivity(threadId, reason);
           if (requestId !== null) pendingTurnStarts.set(requestId, provisionalTurn);
-          const route = await takePendingRoute(threadId);
-          const applied = applyRouteToTurnStart(message, route);
+          const pendingRoute = await takePendingRoute(threadId);
+          const route = pendingRoute?.route ?? pendingRoute;
+          releasePendingRoute = pendingRoute?.release ?? null;
+          const applied = applyRouteToTurnStart(message, route, activeProviders.get(threadId));
           payload = JSON.stringify(applied.message);
           if (applied.receipt) {
-            receipts.set(applied.receipt.threadId, applied.receipt);
-            await onRouteInjected(applied.receipt);
+            routeReceipt = applied.receipt;
+            acknowledgeRoute = pendingRoute?.ack ?? null;
+          } else {
+            await releasePendingRoute?.();
+            releasePendingRoute = null;
           }
         }
+        await forwardPayload(upstream, payload);
+        routeForwarded = true;
+        if (routeReceipt) {
+          receipts.set(routeReceipt.threadId, routeReceipt);
+          await acknowledgeRoute?.();
+          await onRouteInjected(routeReceipt);
+        }
+        releaseRouteLease?.();
       } catch (error) {
+        protocolFailed = true;
+        if (!routeForwarded) {
+          try {
+            await releasePendingRoute?.();
+          } catch (releaseError) {
+            error = new AggregateError([error, releaseError], "Statewright route forwarding and reservation release both failed.");
+          }
+        }
+        releaseRouteLease?.();
         if (provisionalTurn) {
           removeActivity(provisionalTurn.threadId, provisionalTurn.reason);
           if (provisionalTurn.requestId !== null) pendingTurnStarts.delete(provisionalTurn.requestId);
@@ -228,7 +292,6 @@ export async function startCodexAppServerRouteProxy({
         downstream.close(1011, `Statewright route proxy failed: ${error.message}`);
         return;
       }
-      forwardWhenOpen(upstream, payload);
     });
     upstream.on("message", async (raw) => {
       let payload = String(raw);
@@ -237,6 +300,10 @@ export async function startCodexAppServerRouteProxy({
         const responseId = notification.id === undefined ? null : String(notification.id);
         const responseTo = responseId === null ? null : requestMethods.get(responseId);
         if (responseTo) requestMethods.delete(responseId);
+        if ((responseTo === "thread/start" || responseTo === "thread/resume") && notification?.result?.thread?.id) {
+          const provider = String(notification.result.thread.modelProvider ?? "").trim();
+          if (provider) activeProviders.set(String(notification.result.thread.id), provider);
+        }
         const pendingTurn = responseId === null ? null : pendingTurnStarts.get(responseId);
         if (pendingTurn) {
           pendingTurnStarts.delete(responseId);
@@ -279,7 +346,10 @@ export async function startCodexAppServerRouteProxy({
       // message. `ws` exposes received text as a Buffer by default; sending
       // that buffer would silently convert it into a binary frame, which the
       // native Codex TUI rejects during its initialize handshake.
-      forwardWhenOpen(downstream, payload);
+      void forwardWhenOpen(downstream, payload).catch((error) => onTransportError({
+        side: "upstream_to_native",
+        message: error instanceof Error ? error.message : String(error),
+      })).catch(() => {});
     });
     const closePeer = () => {
       if (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING) upstream.close();

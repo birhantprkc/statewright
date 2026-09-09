@@ -20,7 +20,7 @@ MAX_RETRIES="${2:-3}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_SCRIPT="$SCRIPT_DIR/deepswe-run.sh"
 
-BASE_URL="https://qwen2-5-coder-14b.ollama.casa.enhasa.cloud/v1"
+BASE_URL="${SW_BASE_URL:-http://127.0.0.1:11434/v1}"
 BASE_MODEL="qwen3:8b"
 ESCALATION_MODEL="gemma4:12b"
 STEPS=50

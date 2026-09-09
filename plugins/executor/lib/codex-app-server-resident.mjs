@@ -17,6 +17,7 @@ const RESIDENT_RUNTIME_FILES = [
   RESIDENT_ENTRYPOINT,
   join(EXECUTOR_ROOT, "codex-app-server-transport.mjs"),
   join(EXECUTOR_ROOT, "codex-app-server-route-proxy.mjs"),
+  join(EXECUTOR_ROOT, "model-ladder.mjs"),
   join(EXECUTOR_ROOT, "error-reporting.mjs"),
   join(EXECUTOR_ROOT, "managed-client-identity.mjs"),
 ];
@@ -64,20 +65,59 @@ async function writeManifest(path, value) {
   await rename(temporary, path);
 }
 
-export async function nextCodexResidentRouteRequest(controlDir, clientId, threadId = null) {
+export async function nextCodexResidentRouteRequest(controlDir, clientId, threadId = null, {
+  renameImpl = rename,
+  unlinkImpl = unlink,
+} = {}) {
   const { readdir } = await import("node:fs/promises");
   const entries = (await readdir(controlDir)).filter((name) => name === "route.json" || name.endsWith(".route.json")).sort();
   for (const name of entries) {
     const path = join(controlDir, name);
-    const request = JSON.parse(await readFile(path, "utf8"));
-    const registration = await readCodexRootSession(controlDir, clientId);
-    if (codexRouteOwnsRoot(request, registration)) {
-      if (threadId && request.session_id !== threadId) return null;
-      await unlink(path).catch(() => {});
-      return request;
+    const reservationPath = `${path}.${process.pid}.${randomUUID()}.inflight`;
+    try {
+      await renameImpl(path, reservationPath);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
     }
-    await unlink(path).catch(() => {});
-    process.stderr.write("[statewright] discarded route request outside the attached Codex root session.\n");
+    const retryPath = `${path}.${randomUUID()}.retry.route.json`;
+    let settled = false;
+    const ack = async () => {
+      if (settled) return;
+      try {
+        await unlinkImpl(reservationPath);
+        settled = true;
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        settled = true;
+      }
+    };
+    const release = async () => {
+      if (settled) return;
+      try {
+        await renameImpl(reservationPath, retryPath);
+        settled = true;
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        settled = true;
+      }
+    };
+    try {
+      const request = JSON.parse(await readFile(reservationPath, "utf8"));
+      const registration = await readCodexRootSession(controlDir, clientId);
+      if (codexRouteOwnsRoot(request, registration)) {
+        if (threadId && request.session_id !== threadId) {
+          await release();
+          return null;
+        }
+        return { route: request, ack, release };
+      }
+      await ack();
+      process.stderr.write("[statewright] discarded route request outside the attached Codex root session.\n");
+    } catch (error) {
+      await release().catch(() => {});
+      throw error;
+    }
   }
   return null;
 }

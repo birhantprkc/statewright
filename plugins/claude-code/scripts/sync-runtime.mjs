@@ -23,6 +23,7 @@ export const RUNTIME_FILES = [
   "executor/statewright-managed-client.mjs",
   "executor/lib/error-reporting.mjs",
   "executor/lib/managed-client-supervisor.mjs",
+  "executor/lib/model-ladder.mjs",
   "executor/lib/codex-history-integrity.mjs",
   "executor/lib/managed-client-identity.mjs",
   "executor/lib/managed-mcp-bridge.mjs",

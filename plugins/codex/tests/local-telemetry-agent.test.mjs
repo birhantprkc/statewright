@@ -208,7 +208,8 @@ test("Code Mode tool telemetry preserves raw output only for capture-enabled sta
     const requests = [];
     const service = new LocalTelemetryService({
       dataDir: directory,
-      pocketbaseUrl: "https://statewright.casa.enhasa.cloud",
+      pocketbaseUrl: "https://staging.example.invalid",
+      rawCaptureDestination: "https://capture.example.invalid/",
       apiKey: "local-secret",
       fetchImpl: async (url, request) => {
         requests.push({ url, request });
@@ -231,8 +232,8 @@ test("Code Mode tool telemetry preserves raw output only for capture-enabled sta
     assert.deepEqual(service.ingestCodexTool(event), { accepted: 1, raw_queued: 1, ignored: 0 });
     await service.flush();
     assert.deepEqual(requests.map(({ url }) => url), [
-      "https://statewright.casa.enhasa.cloud/api/gateway/telemetry/events",
-      "https://statewright.casa.enhasa.cloud/api/gateway/logs",
+      "https://staging.example.invalid/api/gateway/telemetry/events",
+      "https://capture.example.invalid/",
     ]);
     assert.equal(JSON.parse(requests[1].request.body).event_id, event.event_id);
     assert.equal(JSON.parse(requests[1].request.body).source, "codex_jsonl");
@@ -250,6 +251,31 @@ test("Code Mode tool telemetry preserves raw output only for capture-enabled sta
     });
     assert.equal(production.ingestCodexTool(event).raw_queued, 0);
   });
+});
+
+test("raw capture rejects non-HTTP destinations", async () => {
+  await withTempDir(async (directory) => {
+    assert.throws(() => new LocalTelemetryService({
+      dataDir: directory,
+      pocketbaseUrl: "https://statewright.invalid",
+      rawCaptureDestination: "file:///tmp/raw-capture",
+      apiKey: "local-secret",
+    }), /must use HTTP or HTTPS/);
+  });
+});
+
+test("raw capture identity preserves a significant trailing slash", () => {
+  const withoutSlash = telemetryIdentity({
+    pocketbaseUrl: "https://statewright.invalid",
+    rawCaptureDestination: "https://capture.example.invalid",
+    apiKey: "local-secret",
+  });
+  const withSlash = telemetryIdentity({
+    pocketbaseUrl: "https://statewright.invalid",
+    rawCaptureDestination: "https://capture.example.invalid/",
+    apiKey: "local-secret",
+  });
+  assert.notEqual(withSlash.config_identity, withoutSlash.config_identity);
 });
 
 test("persistent collector tails a bound Code Mode session exactly once", async () => {
@@ -270,7 +296,8 @@ test("persistent collector tails a bound Code Mode session exactly once", async 
     const service = new LocalTelemetryService({
       dataDir: directory,
       codexSessionsDir: join(directory, "sessions"),
-      pocketbaseUrl: "https://statewright.casa.enhasa.cloud",
+      pocketbaseUrl: "https://staging.example.invalid",
+      rawCaptureDestination: "https://capture.example.invalid",
       apiKey: "local-secret",
       fetchImpl: async (url, request) => {
         requests.push({ url, request });

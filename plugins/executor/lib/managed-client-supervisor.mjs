@@ -10,6 +10,7 @@ import { codexHistoryRepairMode, guardCodexResumeHistory } from "./codex-history
 import { bindManagedClientIdentity, codexRouteOwnsRoot, readCodexRootSession, resetCodexRootSession, resolveManagedClientIdentity, resumedSessionId, writeManagedControlIdentity } from "./managed-client-identity.mjs";
 import { resolveApiKey } from "./remote-client.mjs";
 import { createErrorReporter, isExpectedExit } from "./error-reporting.mjs";
+import { providerModel, selectAvailableRoute } from "./model-ladder.mjs";
 
 const CONTINUATION_PROMPT = "Continue the active Statewright workflow in its current state. Use statewright_get_state first.";
 const EXECUTOR_ROOT = dirname(fileURLToPath(import.meta.url));
@@ -328,6 +329,28 @@ function waitForChildExit(exit, milliseconds) {
   });
 }
 
+function processGroupAlive(child, platform) {
+  if (windowsPlatform(platform) || !child.pid) return false;
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+async function waitForManagedChildExit(child, exit, milliseconds, platform) {
+  const deadline = Date.now() + milliseconds;
+  if (!await waitForChildExit(exit, milliseconds)) return false;
+  if (windowsPlatform(platform)) return true;
+  while (processGroupAlive(child, platform)) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, Math.min(25, remaining)));
+  }
+  return true;
+}
+
 export async function restartManagedChild(child, exit, {
   command,
   platform = process.platform,
@@ -343,15 +366,19 @@ export async function restartManagedChild(child, exit, {
     if (cleanup.status !== "success") {
       throw new Error(`Windows managed-client process-tree cleanup failed (${cleanup.status}).`);
     }
-    if (!await waitForChildExit(exit, 1_500)) {
+    if (!await waitForManagedChildExit(child, exit, 1_500, platform)) {
       throw new Error("Windows managed client remained active after successful process-tree cleanup.");
     }
     return;
   }
   await signalChildGroup(child, "SIGINT", { platform, environment });
-  if (await waitForChildExit(exit, 1_500)) return;
+  if (await waitForManagedChildExit(child, exit, 1_500, platform)) return;
   await signalChildGroup(child, "SIGTERM", { platform, environment });
-  await waitForChildExit(exit, 1_500);
+  if (await waitForManagedChildExit(child, exit, 1_500, platform)) return;
+  await signalChildGroup(child, "SIGKILL", { platform, environment });
+  if (!await waitForManagedChildExit(child, exit, 1_500, platform)) {
+    throw new Error("POSIX managed client remained active after SIGKILL process-group cleanup.");
+  }
 }
 
 function routeModel(model) {
@@ -409,9 +436,16 @@ function forwardManagedTermination(child, exit, { command, platform = process.pl
       } else {
         await signalChildGroup(child, signal, { platform, environment });
       }
-      if (await waitForChildExit(exit, 1_500)) return;
+      if (await waitForManagedChildExit(child, exit, 1_500, platform)) return;
       await signalChildGroup(child, "SIGTERM", { platform, environment });
-      await waitForChildExit(exit, 1_500);
+      if (await waitForManagedChildExit(child, exit, 1_500, platform)) return;
+      if (isWindowsCommand(command, platform)) {
+        throw new Error("Windows managed client remained active after process-tree termination.");
+      }
+      await signalChildGroup(child, "SIGKILL", { platform, environment });
+      if (!await waitForManagedChildExit(child, exit, 1_500, platform)) {
+        throw new Error("POSIX managed client remained active after terminal-loss SIGKILL cleanup.");
+      }
     })();
   };
   const onSigint = () => forward("SIGINT");
@@ -457,6 +491,10 @@ export async function createManagedMcpBridge({ environment, clientId, bridgeFact
 }
 
 function stripRouteArgs(args, host) {
+  const isRouteConfigOverride = (value) => {
+    const key = String(value ?? "").split("=", 1)[0].trim();
+    return /(?:^|\.)\s*(?:["'](?:model|model_reasoning_effort|model_provider)["']|model|model_reasoning_effort|model_provider)\s*$/.test(key);
+  };
   const result = [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -468,10 +506,18 @@ function stripRouteArgs(args, host) {
       index += 1;
       continue;
     }
-    if (host === "codex" && arg === "-c" && /(^|\.)model_reasoning_effort\s*=/.test(args[index + 1] ?? "")) {
+    if (/^(?:-m|--model)=/.test(arg)) continue;
+    if (host === "codex" && (arg === "-c" || arg === "--config") && isRouteConfigOverride(args[index + 1])) {
       index += 1;
       continue;
     }
+    if (host === "codex" && /^(?:-c|--config)=/.test(arg) && isRouteConfigOverride(arg.slice(arg.indexOf("=") + 1))) continue;
+    if (host === "codex" && arg === "--oss") continue;
+    if (host === "codex" && arg === "--local-provider") {
+      index += 1;
+      continue;
+    }
+    if (host === "codex" && arg.startsWith("--local-provider=")) continue;
     if (host === "claude" && (arg === "--resume" || arg === "-r" || arg === "--continue" || arg === "-c" || arg === "--session-id" || arg === "--fork-session")) {
       if (arg !== "--continue" && arg !== "-c" && arg !== "--fork-session") index += 1;
       continue;
@@ -483,12 +529,14 @@ function stripRouteArgs(args, host) {
 
 export function buildRoutedArgs({ host, originalArgs, request }) {
   const base = stripRouteArgs(originalArgs, host);
-  const model = host === "claude" ? routeClaudeModel(request.model) : routeModel(request.model);
+  const parsed = providerModel(request.model);
+  const model = host === "claude" ? routeClaudeModel(request.model) : parsed.model;
   if (!request.session_id) throw new Error("Statewright routing request is missing session_id.");
   if (!model) throw new Error("Statewright routing request is missing model.");
   if (host === "codex") {
     const effort = request.effort || "medium";
-    return ["-m", model, "-c", `model_reasoning_effort=${JSON.stringify(effort)}`, ...base,
+    const providerArgs = parsed.provider ? ["-c", `model_provider=${JSON.stringify(parsed.provider)}`] : [];
+    return ["-m", model, ...providerArgs, "-c", `model_reasoning_effort=${JSON.stringify(effort)}`, ...base,
       "resume", request.session_id, CONTINUATION_PROMPT];
   }
   if (host === "claude") {
@@ -687,7 +735,24 @@ export async function runManagedClient({ host, command, args, environment = proc
             // An omitted model is an inherited route. The initial unmanaged TUI
             // model is authoritative, so there is no safe or useful restart.
             if (!request.model) continue;
-            nextArgs = buildRoutedArgs({ host, originalArgs: args, request });
+            let selectedRequest = request;
+            if (host === "codex") {
+              try {
+                selectedRequest = await selectAvailableRoute(request);
+              } catch (error) {
+                // Availability failure is fail-closed: stop the detached child
+                // before the supervisor relinquishes its control directory.
+                await restartManagedChild(child, exit, { command: launchCommand, environment: childEnvironment });
+                throw error;
+              }
+              if (selectedRequest.session_id !== request.session_id
+                  || selectedRequest.client_id !== request.client_id
+                  || selectedRequest.root_session_id !== request.root_session_id) {
+                await restartManagedChild(child, exit, { command: launchCommand, environment: childEnvironment });
+                throw new Error("Statewright model_ladder attempted to alter managed session identity.");
+              }
+            }
+            nextArgs = buildRoutedArgs({ host, originalArgs: args, request: selectedRequest });
             restart = true;
             await restartManagedChild(child, exit, { command: launchCommand, environment: childEnvironment });
             break;

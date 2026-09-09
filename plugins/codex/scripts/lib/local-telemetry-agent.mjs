@@ -201,7 +201,7 @@ export function telemetryIdentity({
       host: String(host),
       port: count(port),
       data_dir: String(dataDir),
-      raw_capture_destination: String(rawCaptureDestination || "").replace(/\/$/, ""),
+      raw_capture_destination: String(rawCaptureDestination || "").trim(),
     }),
   };
 }
@@ -1098,10 +1098,18 @@ export class LocalTelemetryService {
     this.pocketbaseUrl = pocketbaseUrl.replace(/\/$/, "");
     this.gatewayUrl = gatewayUrl.replace(/\/$/, "");
     this.apiKey = apiKey;
-    // `capture_output` is the workflow-level opt-in. Raw Code Mode capture is
-    // accepted only by the staging tenant; production needs redaction before
-    // this transport can be enabled there.
-    this.rawCaptureEnabled = this.pocketbaseUrl === "https://statewright.casa.enhasa.cloud";
+    // `capture_output` is the workflow-level opt-in. The collector also
+    // requires an explicitly configured raw-capture destination so no
+    // deployment identity or private endpoint is compiled into the plugin.
+    const captureDestination = String(rawCaptureDestination).trim();
+    if (captureDestination) {
+      const parsed = new URL(captureDestination);
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        throw new Error("Raw tool capture destination must use HTTP or HTTPS.");
+      }
+    }
+    this.rawCaptureDestination = captureDestination;
+    this.rawCaptureEnabled = Boolean(this.rawCaptureDestination);
     this.fetchImpl = fetchImpl;
     this.activeBindingWindowMs = activeBindingWindowMs;
     this.primaryFlushing = false;
@@ -1347,7 +1355,7 @@ export class LocalTelemetryService {
         try {
           const response = await fetchWithTimeout(
             this.fetchImpl,
-            `${this.pocketbaseUrl}/api/gateway/logs`,
+            this.rawCaptureDestination,
             {
               method: "POST",
               headers: {

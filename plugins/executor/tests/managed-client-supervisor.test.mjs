@@ -80,6 +80,41 @@ test("Windows process-tree cleanup settles after a bounded taskkill timeout", as
   assert.equal(unrefed, true);
 });
 
+test("POSIX managed-child cleanup escalates through SIGKILL and confirms exit", {
+  skip: process.platform === "win32",
+}, async () => {
+  const child = spawn(process.execPath, ["-e", 'process.on("SIGINT", () => {}); process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], {
+    detached: true,
+    stdio: "ignore",
+  });
+  const exit = new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
+  await delay(50);
+  await restartManagedChild(child, exit, { command: "codex", platform: process.platform });
+  assert.throws(() => process.kill(child.pid, 0));
+});
+
+test("POSIX cleanup waits for the entire process group after its leader exits", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "statewright-managed-group-exit-"));
+  const ready = join(root, "grandchild-ready");
+  const captured = join(root, "grandchild.json");
+  const stubbornGrandchild = `const {writeFileSync}=require("node:fs"); process.on("SIGINT",()=>{}); process.on("SIGTERM",()=>{}); writeFileSync(${JSON.stringify(ready)},"yes"); setInterval(()=>{},1000);`;
+  const leader = `const {spawn}=require("node:child_process"); const {writeFileSync}=require("node:fs"); const child=spawn(process.execPath,["-e",${JSON.stringify(stubbornGrandchild)}],{stdio:"ignore"}); writeFileSync(${JSON.stringify(captured)},JSON.stringify({pid:child.pid})); setInterval(()=>{},1000);`;
+  const child = spawn(process.execPath, ["-e", leader], { detached: true, stdio: "ignore" });
+  try {
+    assert.equal(await waitFor(() => access(ready).then(() => true, () => false), 120), true);
+    const grandchild = JSON.parse(await readFile(captured, "utf8"));
+    const exit = new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
+    await restartManagedChild(child, exit, { command: "codex", platform: process.platform });
+    assert.throws(() => process.kill(child.pid, 0));
+    assert.throws(() => process.kill(grandchild.pid, 0));
+  } finally {
+    try { process.kill(-child.pid, "SIGKILL"); } catch { /* already stopped */ }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 for (const status of ["spawn_error", "nonzero", "timeout"]) {
   test(`Windows routed restart rejects wrapper exit after ${status} tree cleanup`, async () => {
     await assert.rejects(
@@ -315,7 +350,7 @@ test("terminating a managed codex exec stops its child and removes its control d
     return false;
   };
   try {
-    await writeFile(fake, `#!/usr/bin/env node\nimport { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nconst grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\nwriteFileSync(${JSON.stringify(captured)}, JSON.stringify({ pid: process.pid, grandchild_pid: grandchild.pid, control: process.env.STATEWRIGHT_ROUTE_CONTROL_DIR }));\nsetInterval(() => {}, 1000);\n`);
+    await writeFile(fake, `#!/usr/bin/env node\nimport { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nprocess.on("SIGHUP", () => {});\nprocess.on("SIGTERM", () => {});\nconst grandchild = spawn(process.execPath, ["-e", "process.on('SIGHUP', () => {}); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });\nwriteFileSync(${JSON.stringify(captured)}, JSON.stringify({ pid: process.pid, grandchild_pid: grandchild.pid, control: process.env.STATEWRIGHT_ROUTE_CONTROL_DIR }));\nsetInterval(() => {}, 1000);\n`);
     await chmod(fake, 0o755);
     await writeFile(harness, `import { runManagedClient } from ${JSON.stringify(new URL(`file://${supervisor}`).href)};\nconst bridgeFactory = () => ({ async start() { this.url = "http://127.0.0.1:9999"; this.token = "test-token"; }, async close() {} });\nprocess.exitCode = await runManagedClient({ host: "codex", command: ${JSON.stringify(fake)}, args: ["exec", "review"], environment: { ...process.env, STATEWRIGHT_API_KEY: "test", STATEWRIGHT_SENTRY_DISABLED: "true" }, home: ${JSON.stringify(root)}, pollMs: 5, bridgeFactory });\n`);
     const wrapper = spawn(process.execPath, [harness], { stdio: "ignore" });
@@ -345,7 +380,7 @@ test("losing a POSIX terminal stops an interactive managed client process group"
   const supervisor = fileURLToPath(new URL("../lib/managed-client-supervisor.mjs", import.meta.url));
   let child = null;
   try {
-    await writeFile(fake, `#!/usr/bin/env node\nimport { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nconst grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\nwriteFileSync(${JSON.stringify(captured)}, JSON.stringify({ pid: process.pid, grandchild_pid: grandchild.pid, control: process.env.STATEWRIGHT_ROUTE_CONTROL_DIR }));\nsetInterval(() => {}, 1000);\n`);
+    await writeFile(fake, `#!/usr/bin/env node\nimport { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nprocess.on("SIGHUP", () => {});\nprocess.on("SIGTERM", () => {});\nconst grandchild = spawn(process.execPath, ["-e", "process.on('SIGHUP', () => {}); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });\nwriteFileSync(${JSON.stringify(captured)}, JSON.stringify({ pid: process.pid, grandchild_pid: grandchild.pid, control: process.env.STATEWRIGHT_ROUTE_CONTROL_DIR }));\nsetInterval(() => {}, 1000);\n`);
     await chmod(fake, 0o755);
     await writeFile(harness, `import { writeFileSync } from "node:fs";\nimport { runManagedClient } from ${JSON.stringify(new URL(`file://${supervisor}`).href)};\nconst bridgeFactory = () => ({ async start() { this.url = "http://127.0.0.1:9999"; this.token = "test-token"; }, async close() {} });\nconst running = runManagedClient({ host: "codex", command: ${JSON.stringify(fake)}, args: ["resume"], environment: { ...process.env, STATEWRIGHT_API_KEY: "test", STATEWRIGHT_SENTRY_DISABLED: "true", STATEWRIGHT_CODEX_TRANSPORT: "restart" }, home: ${JSON.stringify(root)}, pollMs: 5, bridgeFactory });\nconst readiness = setInterval(() => { if (process.listenerCount("SIGHUP") > 0) { writeFileSync(${JSON.stringify(ready)}, "yes"); clearInterval(readiness); } }, 5);\nprocess.exitCode = await running;\n`);
     const wrapper = spawn(process.execPath, [harness], { stdio: "ignore" });
@@ -407,7 +442,7 @@ test("disabled managed-client wrapper does not leak its parent Codex writer iden
 });
 
 test("Codex restart preserves non-route args and applies the requested route", () => {
-  assert.deepEqual(buildRoutedArgs({ host: "codex", originalArgs: ["--full-auto", "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="low"'], request: { session_id: "session-1", model: "openai-codex/gpt-5.6-sol", effort: "high" } }), ["-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"', "--full-auto", "resume", "session-1", "Continue the active Statewright workflow in its current state. Use statewright_get_state first."]);
+  assert.deepEqual(buildRoutedArgs({ host: "codex", originalArgs: ["--full-auto", "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="low"'], request: { session_id: "session-1", model: "openai-codex/gpt-5.6-sol", effort: "high" } }), ["-m", "gpt-5.6-sol", "-c", 'model_provider="openai"', "-c", 'model_reasoning_effort="high"', "--full-auto", "resume", "session-1", "Continue the active Statewright workflow in its current state. Use statewright_get_state first."]);
 });
 
 test("Codex restart replaces an existing resume invocation", () => {
@@ -417,8 +452,34 @@ test("Codex restart replaces an existing resume invocation", () => {
     request: { session_id: "new-session", model: "openai-codex/gpt-5.6-terra", effort: "medium" },
   });
   assert.deepEqual(args, [
-    "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="medium"', "--full-auto",
+    "-m", "gpt-5.6-terra", "-c", 'model_provider="openai"', "-c", 'model_reasoning_effort="medium"', "--full-auto",
     "resume", "new-session", "Continue the active Statewright workflow in its current state. Use statewright_get_state first.",
+  ]);
+});
+
+test("Codex restart applies a custom provider and replaces stale provider overrides", () => {
+  const args = buildRoutedArgs({
+    host: "codex",
+    originalArgs: [
+      "--profile", "local",
+      "-c", 'model="stale-split"',
+      "-c", 'model_provider="openai"',
+      "--config", 'model_reasoning_effort="high"',
+      '--config=model="stale-inline"',
+      '--config=model_provider="other"',
+      '--config=model_reasoning_effort="medium"',
+      "-c", ' model="stale-leading-whitespace"',
+      "-c", '"model_provider"="stale-quoted-key"',
+      '--config= "model_reasoning_effort"="high"',
+      "--oss", "--local-provider", "ollama",
+      "--local-provider=lmstudio",
+    ],
+    request: { session_id: "session-local", model: "local_compatible/local-code-model", effort: "low" },
+  });
+  assert.deepEqual(args, [
+    "-m", "local-code-model", "-c", 'model_provider="local_compatible"', "-c", 'model_reasoning_effort="low"',
+    "--profile", "local", "resume", "session-local",
+    "Continue the active Statewright workflow in its current state. Use statewright_get_state first.",
   ]);
 });
 
@@ -480,8 +541,27 @@ test("managed supervisor only restarts its own child after a route request", asy
     assert.equal(await runManagedClient({ host: "codex", command: fake, args: ["--full-auto"], environment: { PATH: process.env.PATH, STATEWRIGHT_API_KEY: "test" }, home: root, pollMs: 5, bridgeFactory: fakeBridgeFactory }), 0);
     const callsText = await readFile(calls, "utf8");
     assert.match(callsText, /^--full-auto/m);
-    assert.match(callsText, /-m gpt-5\.6-sol -c model_reasoning_effort="high" --full-auto resume session-3/);
+    assert.match(callsText, /-m gpt-5\.6-sol -c model_provider="openai" -c model_reasoning_effort="high" --full-auto resume session-3/);
     assert.match(callsText, /http:\/\/127\.0\.0\.1:9999/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("an unavailable Codex ladder stops the detached child before supervision exits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "statewright-managed-unavailable-ladder-"));
+  const fake = join(root, "fake-codex.mjs");
+  const stopped = join(root, "stopped");
+  try {
+    await writeFile(fake, `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs";\nimport { join } from "node:path";\nconst control = process.env.STATEWRIGHT_ROUTE_CONTROL_DIR;\nwriteFileSync(join(control, "codex-root-session.json"), JSON.stringify({version:1,session_id:"session-unavailable",client_id:process.env.STATEWRIGHT_CLIENT_ID}));\nwriteFileSync(join(control, "route.json"), JSON.stringify({session_id:"session-unavailable",root_session_id:"session-unavailable",client_id:process.env.STATEWRIGHT_CLIENT_ID,model:"local_compatible/local-code-model",model_ladder:[{model:"local_compatible/local-code-model",health_url:"http://127.0.0.1:1"}]}));\nprocess.on("SIGINT", () => { writeFileSync(${JSON.stringify(stopped)}, "yes"); process.exit(0); });\nsetInterval(() => {}, 1000);\n`);
+    await chmod(fake, 0o755);
+    await assert.rejects(
+      runManagedClient({
+        host: "codex", command: fake, args: [],
+        environment: { PATH: process.env.PATH, STATEWRIGHT_API_KEY: "test" },
+        home: root, pollMs: 5, bridgeFactory: fakeBridgeFactory,
+      }),
+      /No Statewright model_ladder candidate passed its availability check/,
+    );
+    await access(stopped);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

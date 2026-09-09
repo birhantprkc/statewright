@@ -51,6 +51,10 @@ test("workflow load emits an atomic route restart request only for a supervised 
         state: "baseline",
         model: "openai-codex/gpt-5.6-sol",
         thinking_level: "high",
+        model_ladder: [
+          { model: "local_compatible/local-code-model", thinking_level: "low", health_url: "https://model.example.invalid/health" },
+          { model: "openai-codex/gpt-5.6-sol", thinking_level: "high" },
+        ],
         run_id: "run-1",
         allowed_tools: ["Read"],
         transitions: [],
@@ -68,6 +72,10 @@ test("workflow load emits an atomic route restart request only for a supervised 
       state: "baseline",
       model: "openai-codex/gpt-5.6-sol",
       effort: "high",
+      model_ladder: [
+        { model: "local_compatible/local-code-model", thinking_level: "low", health_url: "https://model.example.invalid/health" },
+        { model: "openai-codex/gpt-5.6-sol", thinking_level: "high" },
+      ],
     });
     assert.match(route.client_id, /^swc_[0-9a-f]{32}$/);
   } finally {
@@ -225,6 +233,7 @@ test("workflow load requests a hard boundary for a state that inherits its route
     const request = JSON.parse(await readFile(resolve(controlDir, entries[0]), "utf8"));
     assert.equal(request.model, "");
     assert.equal(request.effort, "");
+    assert.deepEqual(request.model_ladder, []);
     assert.equal(request.state, "inherited");
   } finally {
     await rm(home, { recursive: true, force: true });

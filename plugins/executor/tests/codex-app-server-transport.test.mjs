@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
@@ -75,11 +75,29 @@ test("resident App Server accepts routes only for the attached root session", as
   const clientId = "swc_0123456789abcdef0123456789abcdef";
   try {
     await writeFile(join(control, "codex-root-session.json"), JSON.stringify({ version: 1, session_id: "root-thread", client_id: clientId }));
-    await writeFile(join(control, "01-root.route.json"), JSON.stringify({ session_id: "root-thread", root_session_id: "root-thread", client_id: clientId, model: "gpt-5.6-terra" }));
+    const routePath = join(control, "01-root.route.json");
+    await writeFile(routePath, JSON.stringify({ session_id: "root-thread", root_session_id: "root-thread", client_id: clientId, model: "gpt-5.6-terra" }));
     assert.equal(await nextCodexResidentRouteRequest(control, clientId, "child-thread"), null);
-    assert.deepEqual(await nextCodexResidentRouteRequest(control, clientId, "root-thread"), {
+    const candidates = await Promise.all([
+      nextCodexResidentRouteRequest(control, clientId, "root-thread"),
+      nextCodexResidentRouteRequest(control, clientId, "root-thread"),
+    ]);
+    const pending = candidates.find(Boolean);
+    assert.equal(candidates.filter(Boolean).length, 1);
+    assert.deepEqual(pending.route, {
       session_id: "root-thread", root_session_id: "root-thread", client_id: clientId, model: "gpt-5.6-terra",
     });
+    assert.equal((await readdir(control)).filter((name) => name.endsWith(".route.json")).length, 0);
+    await pending.release();
+    const retry = await nextCodexResidentRouteRequest(control, clientId, "root-thread", {
+      unlinkImpl: async () => { const error = new Error("synthetic acknowledgement failure"); error.code = "EACCES"; throw error; },
+    });
+    await assert.rejects(retry.ack(), { code: "EACCES" });
+    assert.equal((await readdir(control)).filter((name) => name.endsWith(".route.json")).length, 0);
+    await retry.release();
+    const finalAttempt = await nextCodexResidentRouteRequest(control, clientId, "root-thread");
+    await finalAttempt.ack();
+    await finalAttempt.ack();
   } finally { await rm(control, { recursive: true, force: true }); }
 });
 
@@ -160,6 +178,27 @@ test("App Server routing overrides the native next turn and requires a settings 
   }, { session_id: "thread-1", model: "gpt-5.6-sol" }), {
     message: { method: "turn/start", params: { threadId: "different-thread" } }, receipt: null,
   });
+});
+
+test("App Server routing selects the ladder entry owned by the persistent thread provider", () => {
+  const route = {
+    session_id: "thread-1",
+    model: "local_compatible/local-code-model",
+    model_ladder: [
+      { model: "local_compatible/local-code-model", thinking_level: "low" },
+      { model: "openai-codex/gpt-5.6-luna", thinking_level: "low" },
+    ],
+  };
+  const local = applyRouteToTurnStart({
+    id: 12, method: "turn/start", params: { threadId: "thread-1", input: [] },
+  }, route, "local_compatible");
+  assert.equal(local.message.params.model, "local-code-model");
+  assert.equal(local.message.params.effort, "low");
+  const cloud = applyRouteToTurnStart({
+    id: 13, method: "turn/start", params: { threadId: "thread-1", input: [] },
+  }, route, "openai");
+  assert.equal(cloud.message.params.model, "gpt-5.6-luna");
+  assert.equal(cloud.message.params.effort, "low");
 });
 
 test("App Server resume history is scoped to the managed project unless the client supplied a cwd", () => {
@@ -408,12 +447,145 @@ test("active-writer resume errors preserve the native refusal and explain when t
   assert.equal(clarifyActiveWriterResumeError(unrelated), unrelated);
 });
 
+test("App Server route proxy keeps a pending route when upstream forwarding fails", async () => {
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(upstream, "listening");
+  const upstreamAddress = upstream.address();
+  let acknowledged = 0;
+  const protocolErrors = [];
+  const proxy = await startCodexAppServerRouteProxy({
+    upstreamUrl: `ws://127.0.0.1:${upstreamAddress.port}`,
+    takePendingRoute: async () => ({
+      route: { session_id: "thread-send-failure", model: "openai-codex/gpt-5.6-sol" },
+      ack: async () => { acknowledged += 1; },
+    }),
+    forwardPayload: async () => { throw new Error("synthetic upstream send failure"); },
+    onProtocolError: async (error) => protocolErrors.push(error),
+  });
+  const client = new WebSocket(proxy.url);
+  try {
+    await once(client, "open");
+    const closed = once(client, "close");
+    client.send(JSON.stringify({
+      id: 1,
+      method: "turn/start",
+      params: { threadId: "thread-send-failure", input: [] },
+    }));
+    await closed;
+    assert.equal(acknowledged, 0);
+    assert.match(protocolErrors[0].message, /synthetic upstream send failure/);
+  } finally {
+    client.close();
+    await proxy.close();
+    await new Promise((resolveClose) => upstream.close(resolveClose));
+  }
+});
+
+test("App Server route proxy reserves a pending route until forwarding acknowledges it", async () => {
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(upstream, "listening");
+  const upstreamAddress = upstream.address();
+  let pending = { session_id: "thread-race", model: "openai-codex/gpt-5.6-sol" };
+  let releaseFirstForward;
+  const firstForwardBlocked = new Promise((resolveForward) => { releaseFirstForward = resolveForward; });
+  let firstForwardStarted;
+  const firstForwarding = new Promise((resolveStarted) => { firstForwardStarted = resolveStarted; });
+  const forwarded = [];
+  const proxy = await startCodexAppServerRouteProxy({
+    upstreamUrl: `ws://127.0.0.1:${upstreamAddress.port}`,
+    takePendingRoute: async (threadId) => pending?.session_id === threadId ? {
+      route: pending,
+      ack: async () => { pending = null; },
+    } : null,
+    forwardPayload: async (_socket, payload) => {
+      forwarded.push(JSON.parse(payload));
+      if (forwarded.length === 1) {
+        firstForwardStarted();
+        await firstForwardBlocked;
+      }
+    },
+  });
+  const client = new WebSocket(proxy.url);
+  try {
+    await once(client, "open");
+    client.send(JSON.stringify({ id: 1, method: "turn/start", params: { threadId: "thread-race", input: [] } }));
+    await firstForwarding;
+    client.send(JSON.stringify({ id: 2, method: "turn/start", params: { threadId: "thread-race", input: [] } }));
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+    assert.equal(forwarded.length, 1);
+    releaseFirstForward();
+    for (let attempt = 0; attempt < 100 && forwarded.length < 2; attempt += 1) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+    }
+    assert.equal(forwarded.length, 2);
+    assert.equal(forwarded[0].params.model, "gpt-5.6-sol");
+    assert.equal(forwarded[1].params.model, undefined);
+  } finally {
+    releaseFirstForward?.();
+    client.close();
+    await proxy.close();
+    await new Promise((resolveClose) => upstream.close(resolveClose));
+  }
+});
+
+test("App Server route proxy quarantines a route after post-forward acknowledgement failure", async () => {
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(upstream, "listening");
+  const upstreamAddress = upstream.address();
+  let reserved = false;
+  let releaseCount = 0;
+  let releaseFirstForward;
+  const firstForwardBlocked = new Promise((resolveForward) => { releaseFirstForward = resolveForward; });
+  let firstForwardStarted;
+  const firstForwarding = new Promise((resolveStarted) => { firstForwardStarted = resolveStarted; });
+  const forwarded = [];
+  const proxy = await startCodexAppServerRouteProxy({
+    upstreamUrl: `ws://127.0.0.1:${upstreamAddress.port}`,
+    takePendingRoute: async () => {
+      if (reserved) return null;
+      reserved = true;
+      return {
+        route: { session_id: "thread-ack-failure", model: "openai-codex/gpt-5.6-sol" },
+        ack: async () => { throw new Error("synthetic acknowledgement failure"); },
+        release: async () => { reserved = false; releaseCount += 1; },
+      };
+    },
+    forwardPayload: async (_socket, payload) => {
+      forwarded.push(JSON.parse(payload));
+      if (forwarded.length === 1) {
+        firstForwardStarted();
+        await firstForwardBlocked;
+      }
+    },
+  });
+  const client = new WebSocket(proxy.url);
+  try {
+    await once(client, "open");
+    const closed = once(client, "close");
+    client.send(JSON.stringify({ id: 1, method: "turn/start", params: { threadId: "thread-ack-failure", input: [] } }));
+    await firstForwarding;
+    client.send(JSON.stringify({ id: 2, method: "turn/start", params: { threadId: "thread-ack-failure", input: [] } }));
+    releaseFirstForward();
+    await closed;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+    assert.equal(forwarded.length, 1);
+    assert.equal(forwarded[0].params.model, "gpt-5.6-sol");
+    assert.equal(releaseCount, 0);
+  } finally {
+    releaseFirstForward?.();
+    client.close();
+    await proxy.close();
+    await new Promise((resolveClose) => upstream.close(resolveClose));
+  }
+});
+
 test("App Server route proxy injects one pending route and records the server receipt", async () => {
   const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await once(upstream, "listening");
   const upstreamAddress = upstream.address();
   const injected = [];
   const confirmed = [];
+  let acknowledged = 0;
   let pending = { session_id: "thread-proxy", model: "openai-codex/gpt-5.6-sol", effort: "high" };
   const proxy = await startCodexAppServerRouteProxy({
     upstreamUrl: `ws://127.0.0.1:${upstreamAddress.port}`,
@@ -421,7 +593,7 @@ test("App Server route proxy injects one pending route and records the server re
       if (pending?.session_id !== threadId) return null;
       const route = pending;
       pending = null;
-      return route;
+      return { route, ack: async () => { acknowledged += 1; } };
     },
     onRouteInjected: async (receipt) => injected.push(receipt),
     onRouteConfirmed: async (receipt) => confirmed.push(receipt),
@@ -451,6 +623,7 @@ test("App Server route proxy injects one pending route and records the server re
   assert.equal(request.params.model, "gpt-5.6-sol");
   assert.equal(request.params.effort, "high");
   assert.equal(injected.length, 1);
+  assert.equal(acknowledged, 1);
   upstreamSocket.send(JSON.stringify({
     method: "thread/settings/updated",
     params: { threadId: "thread-proxy", threadSettings: { model: "gpt-5.6-sol", effort: "high" } },

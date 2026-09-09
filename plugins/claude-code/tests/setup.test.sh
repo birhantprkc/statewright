@@ -6,14 +6,14 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 
 TEST_HOME="$TEST_ROOT/home"
 mkdir -p "$TEST_HOME/.claude" "$TEST_HOME/.statewright"
-printf '%s\n' 'https://statewright-mcp.casa.enhasa.cloud' > "$TEST_HOME/.statewright/gateway_url"
+printf '%s\n' 'https://statewright-mcp.example.invalid' > "$TEST_HOME/.statewright/gateway_url"
 cat > "$TEST_HOME/.claude/.mcp.json" <<'JSON'
 {"mcpServers":{"statewright":{"command":"old"},"other":{"command":"keep"}}}
 JSON
 
 HOME="$TEST_HOME" STATEWRIGHT_GATEWAY_URL='' bash plugins/claude-code/setup.sh >/dev/null
 
-test "$(cat "$TEST_HOME/.statewright/gateway_url")" = "https://statewright-mcp.casa.enhasa.cloud"
+test "$(cat "$TEST_HOME/.statewright/gateway_url")" = "https://statewright-mcp.example.invalid"
 test -s "$TEST_HOME/.statewright/claude-hook-owner"
 python3 - "$TEST_HOME/.claude/.mcp.json" <<'PY'
 import json

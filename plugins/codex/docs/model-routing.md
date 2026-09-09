@@ -118,6 +118,34 @@ A state without `model` inherits the active route. When a state changes models b
 `thinking_level`, the new model's catalog default is used. This prevents a previous Sol `max`
 effort from leaking into a cheaper state.
 
+To use the same workflow with a local provider and a cloud equivalent, declare an ordered
+`model_ladder` on the state instead of copying the workflow:
+
+```json
+{
+  "model": "local_compatible/local-code-model",
+  "model_ladder": [
+    {
+      "model": "local_compatible/local-code-model",
+      "thinking_level": "low",
+      "health_url": "https://model.example.invalid/health"
+    },
+    {
+      "model": "openai-codex/gpt-5.6-luna",
+      "thinking_level": "low"
+    }
+  ]
+}
+```
+
+The restart transport checks each `health_url` in order and launches the first available route,
+including its Codex `model_provider`. The persistent App Server transport instead chooses the
+ladder entry matching the provider that owns the current thread. Codex makes `modelProvider` a
+thread-level setting, so cross-provider outage failover requires the restart transport; a
+persistent thread can still use the same workflow without accidentally sending a local model id
+to OpenAI (or the inverse). The standalone adapter chooses the first ladder entry present in its
+active provider's live model catalog.
+
 Routing is fail-closed:
 
 - An explicit state model missing from the live catalog stops before another turn starts.

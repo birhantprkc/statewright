@@ -7400,7 +7400,7 @@ async fn main() {
     // Default client (used when no per-state routing configured)
     // Escalation model (env override or default to gpt-oss:20b)
     let escalation_url = std::env::var("SW_ESCALATION_URL")
-        .unwrap_or_else(|_| "https://gpt-oss-20b.ollama.casa.enhasa.cloud/v1".into());
+        .unwrap_or_else(|_| "http://127.0.0.1:11434/v1".into());
     let escalation_model =
         std::env::var("SW_ESCALATION_MODEL").unwrap_or_else(|_| "gpt-oss:20b".into());
 
