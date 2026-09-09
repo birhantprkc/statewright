@@ -10,13 +10,6 @@ on:
         type: string
   push:
     branches: [main]
-    paths:
-      - ".github/workflows/windows-plugin-canary.yml"
-      - "plugins/capabilities.json"
-      - "plugins/executor/**"
-      - "plugins/codex/**"
-      - "plugins/claude-code/**"
-      - "plugins/cursor/**"
   pull_request:
     paths:
       - ".github/workflows/windows-plugin-canary.yml"

@@ -121,6 +121,11 @@ test("plugin release workflow resolves distinct names and curated notes", async 
   assert.match(workflow, /STATEWRIGHT_PLUGIN_ROOT: \${{ runner\.temp }}\/plugin-candidate/);
   assert.match(workflow, /publish:\n\s+needs: \[package, artifact-smoke\]/);
   assert.match(windowsCanary, /push:\n\s+branches: \[main\]/);
+  assert.match(
+    windowsCanary,
+    /push:\n\s+branches: \[main\]\n\s+pull_request:/,
+    "every main commit must produce trusted exact-SHA Windows evidence for the release gate",
+  );
   assert.match(windowsCanary, /name: Run managed-client bootstrap canary\n\s+timeout-minutes: 3/);
   assert.match(windowsCanary, /name: Run managed-client route canary\n\s+timeout-minutes: 3/);
   assert.match(
