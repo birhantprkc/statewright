@@ -281,8 +281,16 @@ try {
   assert.equal(removed.removed.length, 2, "uninstall must remove both managed Windows shims");
   for (const host of ["codex", "claude"]) {
     const source = await shellVersion(host, environment);
-    assert.notEqual(win32.basename(source).toLowerCase(), `${host}.cmd`);
-    assert.notEqual(win32.basename(await cmdSource(host, managedPath)).toLowerCase(), `${host}.cmd`);
+    assert.doesNotMatch(
+      source.toLowerCase(),
+      /[\\/]\.statewright[\\/]bin[\\/]/i,
+      "PowerShell must stop resolving the managed shim directory after uninstall",
+    );
+    assert.doesNotMatch(
+      (await cmdSource(host, managedPath)).toLowerCase(),
+      /[\\/]\.statewright[\\/]bin[\\/]/i,
+      "cmd.exe must stop resolving the managed shim directory after uninstall",
+    );
   }
   console.log("Windows managed-client bootstrap canary passed for Codex and Claude.");
 } finally {
