@@ -31,6 +31,8 @@ interface HookResponse {
   transition?: string
   completed?: boolean
   ready?: boolean
+  deliveryRequired?: boolean
+  executor?: { active: boolean; id?: string; delivery?: boolean }
 }
 
 export interface StateResponse {
@@ -261,12 +263,12 @@ async function enforceBeforeTool(
   adapter: string,
   input: { tool: string; args: Record<string, unknown> },
   token: string | null = process.env.STATEWRIGHT_ADAPTER_TOKEN ?? null,
-): Promise<void> {
+): Promise<HookResponse | null> {
   const resp = await hookRequest(adapter, "pre-tool", {
     tool_name: input.tool,
     tool_input: input.args ?? {},
   }, token)
-  if (!resp) return
+  if (!resp) return null
 
   if (resp.decision === "deny") {
     throw new Error(
@@ -278,6 +280,7 @@ async function enforceBeforeTool(
   if (additionalContext) {
     console.log(`[statewright] ${additionalContext}`)
   }
+  return resp
 }
 
 function reportPluginEvent(event = "connect") {
@@ -378,9 +381,10 @@ function createStatewrightHooks(
       output: { args: Record<string, unknown> },
     ) => {
       if (input.tool.includes("statewright_")) return
-      const state = await getState(adapter, token)
-      if (state) requireDeliveryOwner(state)
-      await enforceBeforeTool(adapter, { tool: input.tool, args: output.args }, token)
+      // The pre-tool response is the authoritative policy snapshot for this
+      // tool invocation. Avoid a second state fetch that can race a transition.
+      const response = await enforceBeforeTool(adapter, { tool: input.tool, args: output.args }, token)
+      if (response) requireDeliveryOwner(response)
     },
 
     // After each tool call — track iterations, detect transitions

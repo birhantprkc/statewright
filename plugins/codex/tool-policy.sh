@@ -89,13 +89,46 @@ EOF
 
 statewright_has_file_write_redirect() {
   local command="$1" normalized
-  normalized=$(printf '%s' "$command" | sed -E \
+  normalized=$(statewright_unquoted_shell "$command" | sed -E \
     -e 's/(^|[[:space:]])[012]?>[[:space:]]*\/dev\/null([[:space:]]|$)/ /g' \
     -e 's/(^|[[:space:]])2>&1([[:space:]]|$)/ /g')
   case "$normalized" in
     *'>'*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# Remove quoted shell literals before looking for executable operations. This
+# avoids denying read-only searches such as `rg 'sed -i'`.
+statewright_unquoted_shell() {
+  local input="$1" output="" quote="" char index=0
+  while [ "$index" -lt "${#input}" ]; do
+    char="${input:$index:1}"
+    if [ -n "$quote" ]; then
+      if [ "$char" = "$quote" ]; then quote=""; fi
+      index=$((index + 1))
+      continue
+    fi
+    case "$char" in
+      "'"|'"') quote="$char" ;;
+      '\\') index=$((index + 1)) ;;
+      *) output+="$char" ;;
+    esac
+    index=$((index + 1))
+  done
+  printf '%s' "$output"
+}
+
+statewright_has_inplace_file_modify() {
+  local normalized
+  normalized=$(statewright_unquoted_shell "$1")
+  printf '%s\n' "$normalized" | grep -qE '(^|[[:space:];|&])(sed[[:space:]]+-[^[:space:]]*i|perl[[:space:]]+-p?i)([[:space:]]|$)'
+}
+
+statewright_has_file_write_primitive() {
+  local normalized
+  normalized=$(statewright_unquoted_shell "$1")
+  printf '%s\n' "$normalized" | grep -qE '(^|[[:space:];|&])(tee|dd|cp|mv|ln|install|rsync|mkdir|touch|chmod|chown)([[:space:]]|$)'
 }
 
 statewright_web_allowed() {

@@ -35,6 +35,24 @@ if statewright_has_file_write_redirect 'cat missing 2>/dev/null'; then
   echo "expected /dev/null redirect to remain read-only" >&2
   exit 1
 fi
+if statewright_has_file_write_redirect "rg '>' src"; then
+  echo "expected quoted redirect literal to remain read-only" >&2
+  exit 1
+fi
+if statewright_has_inplace_file_modify "rg 'sed -i' src"; then
+  echo "expected quoted in-place literal to remain read-only" >&2
+  exit 1
+fi
+if ! statewright_has_inplace_file_modify "sed -i 's/a/b/' file"; then
+  echo "expected sed -i to be treated as an in-place write" >&2
+  exit 1
+fi
+for command in 'tee file' 'dd of=file' 'cp from to' 'mv from to' 'ln from to' 'install from to' 'rsync from to' 'mkdir dir' 'touch file' 'chmod 600 file' 'chown user file'; do
+  if ! statewright_has_file_write_primitive "$command"; then
+    echo "expected $command to be treated as a file write" >&2
+    exit 1
+  fi
+done
 assert_denied "Read" Bash "$(shell_input 'python3 -c "print(1)"')"
 assert_denied "Read" Bash "$(shell_input 'git stash')"
 assert_allowed "Edit" apply_patch '{}'

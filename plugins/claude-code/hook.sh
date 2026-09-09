@@ -493,13 +493,19 @@ case "$ENDPOINT" in
             HAS_WRITE=$(echo "$ALLOWED" | grep -qx "Write" && echo "yes" || echo "no")
             HAS_EDIT=$(echo "$ALLOWED" | grep -qx "Edit" && echo "yes" || echo "no")
             if [ "$HAS_WRITE" = "no" ] && [ "$HAS_EDIT" = "no" ]; then
-              if echo "$COMMAND" | grep -qE '(^|[^0-9])>[^>&]|>>\s*\S'; then
+              COMMAND_SURFACE=$(printf '%s' "$COMMAND" | sed -E "s/'[^']*'//g; s/\"[^\"]*\"//g" | sed -E -e 's/(^|[[:space:]])[012]?>[[:space:]]*\/dev\/null([[:space:]]|$)/ /g' -e 's/(^|[[:space:]])2>&1([[:space:]]|$)/ /g')
+              if echo "$COMMAND_SURFACE" | grep -qE '(^|[^0-9])>[^>&]|>>\s*\S'; then
                 REASON="Bash command blocked: output redirect detected but Write/Edit not in allowed tools for '$CURRENT' phase."
                 jq -n --arg r "$REASON" '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$r}}'
                 exit 0
               fi
-              if echo "$COMMAND" | grep -qE 'sed\s+-i|perl\s+-p?i'; then
+              if echo "$COMMAND_SURFACE" | grep -qE '(^|[;&|[:space:]])(sed[[:space:]]+-[^[:space:]]*i|perl[[:space:]]+-p?i)([[:space:]]|$)'; then
                 REASON="Bash command blocked: in-place file modification detected but Edit not in allowed tools for '$CURRENT' phase."
+                jq -n --arg r "$REASON" '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$r}}'
+                exit 0
+              fi
+              if echo "$COMMAND_SURFACE" | grep -qE '(^|[;&|[:space:]])(tee|dd|cp|mv|ln|install|rsync|mkdir|touch|chmod|chown)([[:space:]]|$)'; then
+                REASON="Bash command blocked: file-writing command detected but Write/Edit not in allowed tools for '$CURRENT' phase."
                 jq -n --arg r "$REASON" '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$r}}'
                 exit 0
               fi

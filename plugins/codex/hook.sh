@@ -541,8 +541,13 @@ case "$ENDPOINT" in
               jq -n --arg r "$REASON" '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$r}}'
               exit 0
             fi
-            if echo "$COMMAND" | grep -qE 'sed\s+-i|perl\s+-p?i'; then
+            if statewright_has_inplace_file_modify "$COMMAND"; then
               REASON="Bash command blocked: in-place file modification detected but Edit not in allowed tools for '$CURRENT' phase."
+              jq -n --arg r "$REASON" '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$r}}'
+              exit 0
+            fi
+            if statewright_has_file_write_primitive "$COMMAND"; then
+              REASON="Bash command blocked: file-writing command detected but Write/Edit not in allowed tools for '$CURRENT' phase."
               jq -n --arg r "$REASON" '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$r}}'
               exit 0
             fi

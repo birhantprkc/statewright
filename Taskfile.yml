@@ -47,6 +47,9 @@ tasks:
       - npm test --prefix plugins/pi
       - npm test --prefix plugins/opencode
       - npm test --prefix plugins/omx
+      - bash plugins/codex/tests/tool-policy.test.sh
+      - bash plugins/codex/tests/mcp-proxy-handshake.test.sh
+      - bash plugins/claude-code/tests/bash-discernment.test.sh
       - bash -n plugins/codex/hook.sh plugins/codex/client-id.sh plugins/codex/mcp-proxy.sh
       - bash -n plugins/claude-code/hook.sh plugins/claude-code/client-id.sh plugins/claude-code/mcp-proxy.sh plugins/claude-code/setup.sh
       - git diff --check

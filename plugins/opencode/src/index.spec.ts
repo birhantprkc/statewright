@@ -276,15 +276,10 @@ describe("OpenCode host contract", () => {
   })
 
   it("uses OpenCode's two-argument tool hook contract", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ deliveryRequired: false }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ decision: "allow" }),
-      })
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ decision: "allow", deliveryRequired: false }),
+    })
     vi.stubGlobal("fetch", fetchMock)
     const hooks = createStatewrightHooks("4321", {
       tui: { showToast: vi.fn().mockResolvedValue(undefined) },
@@ -294,10 +289,30 @@ describe("OpenCode host contract", () => {
       { tool: "bash" },
       { args: { command: "git status --short" } },
     )
-    expect(fetchMock.mock.calls[1][1].body).toBe(JSON.stringify({
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/hooks/pre-tool")
+    expect(fetchMock.mock.calls[0][1].body).toBe(JSON.stringify({
       tool_name: "bash",
       tool_input: { command: "git status --short" },
     }))
+    vi.unstubAllGlobals()
+  })
+
+  it("uses the pre-tool response for isolated-delivery enforcement", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ decision: "allow", deliveryRequired: true }),
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const hooks = createStatewrightHooks("4321", {
+      tui: { showToast: vi.fn().mockResolvedValue(undefined) },
+    })
+
+    await expect(hooks["tool.execute.before"](
+      { tool: "bash" },
+      { args: { command: "git status --short" } },
+    )).rejects.toThrow("Statewright executor")
+    expect(fetchMock).toHaveBeenCalledTimes(1)
     vi.unstubAllGlobals()
   })
 
