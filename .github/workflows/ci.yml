@@ -41,6 +41,8 @@ jobs:
           npm ci --ignore-scripts --prefix plugins/pi
           npm ci --ignore-scripts --prefix plugins/opencode
           npm ci --ignore-scripts --prefix plugins/omx
+      - name: Install zsh regression dependency
+        run: sudo apt-get update && sudo apt-get install -y zsh
       - name: Install Task
         run: go install github.com/go-task/task/v3/cmd/task@v3.39.2
       - name: Run plugin release contracts

@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { access, chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { bindManagedClientIdentity, resolveManagedClientIdentity, resumedSessionId } from "../lib/managed-client-identity.mjs";
@@ -794,6 +794,10 @@ test("managed Codex discovers the actual root thread behind resume --last", asyn
 
 test("managed Codex ignores an ephemeral child route emitted through a zsh login-shell bypass", async (t) => {
   if (process.platform === "win32") return t.skip("zsh regression is POSIX-only");
+  const zshCandidates = ["/bin/zsh", "/usr/bin/zsh", ...String(process.env.PATH ?? "").split(delimiter).filter(Boolean).map((directory) => join(directory, "zsh"))];
+  const zsh = await Promise.all([...new Set(zshCandidates)].map(async (path) => await access(path).then(() => path, () => null)))
+    .then((paths) => paths.find(Boolean));
+  if (!zsh) return t.skip("zsh is not installed");
   const root = await mkdtemp(join(tmpdir(), "statewright-managed-codex-zsh-"));
   const parent = join(root, "parent-codex.mjs");
   const directBin = join(root, "direct-bin");
@@ -808,7 +812,7 @@ test("managed Codex ignores an ephemeral child route emitted through a zsh login
     await writeFile(join(zdotdir, ".zprofile"), `export PATH=${JSON.stringify(directBin)}:$PATH\n`);
     await writeFile(join(shimBin, "codex"), `#!/usr/bin/env bash\nexit 97\n`);
     await writeFile(join(directBin, "codex"), `#!/usr/bin/env bash\nprintf selected > ${JSON.stringify(selected)}\nprintf '{"session_id":"ephemeral-child","client_id":"%s","model":"openai-codex/gpt-5.6-sol","effort":"high"}' "$STATEWRIGHT_CLIENT_ID" > "$STATEWRIGHT_ROUTE_CONTROL_DIR/child.route.json"\n`);
-    await writeFile(parent, `#!/usr/bin/env node\nimport { appendFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nappendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + "\\n");\nspawnSync("/bin/zsh", ["-lc", "codex exec --ephemeral review-this-diff"], { env: process.env, stdio: "inherit" });\nsetTimeout(() => process.exit(0), 100);\n`);
+    await writeFile(parent, `#!/usr/bin/env node\nimport { appendFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nappendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + "\\n");\nspawnSync(${JSON.stringify(zsh)}, ["-lc", "codex exec --ephemeral review-this-diff"], { env: process.env, stdio: "inherit" });\nsetTimeout(() => process.exit(0), 100);\n`);
     await chmod(join(shimBin, "codex"), 0o755);
     await chmod(join(directBin, "codex"), 0o755);
     await chmod(parent, 0o755);
