@@ -176,6 +176,13 @@ test("plugin release workflow resolves distinct names and curated notes", async 
   assert.match(claudeHook, /AUTHORITATIVE_EPOCH=.*\.state_epoch/);
 });
 
+test("hosted plugin contracts expose installed Task to nested adapter tests", async () => {
+  const workflow = await readFile(resolve(root, ".github/workflows/ci.yml"), "utf8");
+  assert.match(workflow, /go install github\.com\/go-task\/task\/v3\/cmd\/task@v3\.39\.2/);
+  assert.match(workflow, /echo "\$\(go env GOPATH\)\/bin" >> "\$GITHUB_PATH"/);
+  assert.match(workflow, /task test:plugin-release/);
+});
+
 test("release gate accepts successful exact-commit hosted canaries", async () => {
   const messages = [];
   const evidence = await requirePluginCanaries({
