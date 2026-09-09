@@ -27,7 +27,7 @@ open_keys_page() {
     if [ -n "${STATEWRIGHT_BROWSER_OPEN_PROBE:-}" ]; then
       # Use an explicit PowerShell argument array so query strings survive
       # Windows Start-Process parsing (notably the `=` in redirect=/keys).
-      browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '${STATEWRIGHT_BROWSER_OPEN_PROBE}' -ArgumentList @('$url') -Wait")
+      browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '${STATEWRIGHT_BROWSER_OPEN_PROBE}' -ArgumentList @('\"$url\"') -Wait")
     else
       browser_command=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process -FilePath '$url'")
     fi
