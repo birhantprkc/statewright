@@ -153,10 +153,14 @@ export async function resolveManagedClientIdentity({ host, args, home = homedir(
   const key = bindingKey(host, sessionId, cwd);
   const restored = store.bindings[key];
   if (validId(restored)) return { clientId: restored, sessionId, restored: true };
-  const clientId = opaqueId();
-  store.bindings[key] = clientId;
+  const clientId = deterministicResumeId(host, sessionId);
+  // Scope resumed identities by project. A thread may be resumed from a
+  // different checkout; reusing the old client ID could attach it to the
+  // wrong resident app-server and cross project boundaries.
+  const scopedClientId = opaqueId();
+  store.bindings[key] = scopedClientId;
   await saveStore(home, store);
-  return { clientId, sessionId, restored: false };
+  return { clientId: scopedClientId, sessionId, restored: false };
 }
 
 export async function bindManagedClientIdentity({ host, sessionId, clientId, home = homedir(), cwd = process.cwd() }) {
